@@ -7,10 +7,9 @@
 # Usage:
 #   sh 03_setup_openwrt_rootfs.sh [rootfs.tar.gz]
 #
-# Track A (stock kernel, fw3 + iptables-legacy):
-#   openwrt-21.02.7-armvirt-64-default-rootfs.tar.gz
-# Track B (custom kernel, fw4 + nftables):
-#   openwrt-23.05.5-armsr-armv8-rootfs.tar.gz
+# Supported rootfs (kernel has CONFIG_NF_TABLES=n):
+#   openwrt-21.02.7-armvirt-64-default-rootfs.tar.gz  (fw3 + iptables-legacy)
+# 22.03+/23.05+ default to fw4/nftables and must have fw4 disabled.
 # ==============================================================================
 
 set -e
@@ -37,8 +36,8 @@ fi
 if [ -z "$TAR_FILE" ] || [ ! -f "$TAR_FILE" ]; then
     echo "[!] No rootfs tarball found."
     echo "    Put one of these in /data/openwrt/images/ and rerun:"
-    echo "      openwrt-21.02.7-armvirt-64-default-rootfs.tar.gz  (stock kernel / fw3)"
-    echo "      openwrt-23.05.5-armsr-armv8-rootfs.tar.gz         (custom kernel / fw4)"
+    echo "      openwrt-21.02.7-armvirt-64-default-rootfs.tar.gz  (recommended: fw3 + iptables-legacy)"
+    echo "      openwrt-23.05.5-armsr-armv8-rootfs.tar.gz         (requires fw4 disabled)"
     exit 1
 fi
 
@@ -130,9 +129,8 @@ config interface 'wan'
     list dns '223.5.5.5'
     list dns '119.29.29.29'
 
-# IPv6: intentionally no static ULA and no NAT66 here.
-# Native IPv6 (carrier /64 + NDP proxy) is documented in IPV6_NOTES.md
-# and will be added after verifying the carrier prefix on rmnet_data0.
+# IPv6: no static ULA and no NAT66 here.
+# Native IPv6 (carrier /64 + RA) is configured dynamically by 04; see IPV6_NOTES.md.
 EOF
 
 cat > "$DEST_DIR/etc/config/firewall" <<'EOF'

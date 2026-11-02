@@ -1,206 +1,241 @@
-# 一加9 Pro OpenWrt 内核构建与刷机指南
+# 构建、刷机、部署与验证
 
-本目录的 GitHub Actions 工作流会构建：
+本文档记录当前固件的完整落地流程：**自定义 KABI 安全内核 → 刷入 boot → 部署 OpenWrt 21.02.7 容器 → 网络/自启 → 验证**。
 
-1. **`AnyKernel3-OnePlus9Pro-OpenWrt-5.4.zip`**  
-   带 OpenWrt 容器依赖 + Realtek RTL8156/RTL8156B 2.5G 驱动的 Linux 5.4.254 内核，用 **Kernel Flasher** 刷入。
-2. **`r8152-2.5G-Magisk-Module.zip`**  
-   原厂内核免刷机兜底方案：通过 Magisk 模块加载 `r8152 v2.22.1` 驱动（可选）。
-3. **`Image` / `r8152_2p5g.ko` / `stock-config-used.txt`**  
-   供校验与排查。
-
----
-
-## 推荐顺序（重要）
-
-**先做零刷机方案，再考虑自定义内核。**
-
-1. **第一步：跑 `Build r8152 2.5G Module for Stock Kernel`**  
-   产物是 `r8152-2.5G-Magisk-Module.zip`。在原厂内核 + Magisk 上安装这个模块，就能让原厂内核认 RTL8156/RTL8156B 2.5G 网卡。  
-   **不刷内核、不改分区、零变砖风险**，5G 基带、显示、触控、充电全部保持原厂状态。
-
-2. **第二步：用原厂内核 + OpenWrt 21.02 跑通 5G 软路由**  
-   原厂内核已经具备 `NET_NS` / `VETH` / `BRIDGE` / `OVERLAY_FS` 和 IPv4 iptables；配合 `openwrt-21.02.7-armvirt-64-default-rootfs.tar.gz`（`fw3` + `iptables-legacy`）就能跑容器。  
-   先用你现有的千兆网卡验证 5G WAN、LAN、DHCP、DNS、NAT 全部正常。
-
-3. **第三步（可选/实验性）：再尝试自定义内核**  
-   `Build OnePlus 9 Pro 5.4 Kernel (OpenWrt + RTL8156B)` 会打开 PID/IPC/USER 命名空间、nftables、IPv6 NAT66，并把 2.5G 驱动编进内核。  
-   主内核 Kconfig 和 `OplusKernelEnvConfig.mk` 会保留 OPLUS 的调度/锁/内存/显示核心（工作流已设置 `BRAND_SHOW_FLAG=oneplus`，C 宏和结构体布局与 Stock 一致）；真正可能缺的是 `vendor/oplus` 里的厂商驱动/模块，以及预编译 `vendor_dlkm` 模块的 ABI 兼容性。**这是实验性路线，建议在原厂内核方案稳定后再试，并先备份 boot。**
+> **当前基线（2026-10）**
+> - Android：OOS 14 `LE2120_14.0.0.1901`
+> - 内核：`5.4.254-qgki-gd2a1055adeb0`，GitHub Actions build `40346641157`（run4）
+> - KABI：1,607 / 1,607 符号 CRC 匹配
+> - OpenWrt：21.02.7 `armvirt/64`（`fw3` + `iptables-legacy`）
+> - 当前 boot：`artifacts/kernel_run4/new-boot-custom-v3.img`
+>
+> 旧的“原厂内核 + r8152 Magisk 模块”路线仅作为**零刷机兜底/回滚参考**，不再是主路线。
 
 ---
 
-## 一、这次构建的关键事实
+## 1. 构建产物
+
+| 产物 | 说明 |
+| :--- | :--- |
+| `AnyKernel3-OnePlus9Pro-OpenWrt-5.4.zip` | 给 Kernel Flasher 用；保留当前 boot 的 ramdisk（含 Magisk） |
+| `Image` | 裸内核，48,421,376 字节；**不能直接 fastboot 刷** |
+| `Module.symvers` | 本次构建的导出符号 CRC，用于 KABI 审计与新固件对比 |
+| `new-boot-custom-v3.img` | 已打包好的完整 boot（Magisk ramdisk + 自定义内核），可直接刷 `boot_a` |
+| `r8152_2p5g.ko` | 原厂内核兜底模块（当前已不使用） |
+| `r8152-2.5G-Magisk-Module.zip` | 原厂内核 + Magisk 的免刷机方案（备用） |
+| `stock-config-used.txt` | 本次实际使用的内核配置 |
+
+关键事实：
 
 | 项目 | 值 |
 | :--- | :--- |
-| 内核源码 | OnePlusOSS `oneplus/sm8350_u_14.0.0_oneplus9`（Linux 5.4.254） |
-| 配置基线 | 从官方 `LE2120_14.0.0.1901` 的 `boot.img` 提取的**真实运行配置** |
-| 编译器 | Android Clang **11.0.2 r383902b1**（与官方固件 `CONFIG_CC_VERSION_TEXT` 完全一致） |
-| 2.5G 驱动 | Realtek 官方 `r8152` **v2.22.1**，支持 RTL8156 / RTL8156B / RTL8156BG |
-| 内核 localversion | `-qgki-gd2a1055adeb0`（与官方 `5.4.254-qgki-gd2a1055adeb0` 对齐，尽量保持 vendor 模块兼容） |
-| boot 镜像 | header v3，kernel 45.41 MiB，ramdisk 20.47 MiB（**AnyKernel3 必须保留 ramdisk**） |
-
-### 原厂内核的真实能力
-
-| 能力 | 原厂内核 | 说明 |
-| :--- | :---: | :--- |
-| `NET_NS` / `VETH` / `BRIDGE` / `OVERLAY_FS` | ✅ | 可做 veth + 容器 |
-| `IP_NF_IPTABLES` / `IP_NF_NAT` / `MASQUERADE` | ✅ | IPv4 NAT 可用 |
-| `MOUNT_NS` | ✅（`NAMESPACES=y`） | Linux 没有单独的 `MOUNT_NS` 配置项 |
-| `PID_NS` / `IPC_NS` / `USER_NS` | ❌ | 原厂关闭；自定义内核开启 |
-| `NF_TABLES`（fw4/nftables） | ❌ | 原厂只能 `fw3` + `iptables-legacy` |
-| 原生 IPv6 同 /64 共享 | ✅ | 原厂内核即可，不需要 NAT66 |
-| `DEVTMPFS` | ❌ | 容器必须 bind-mount `/dev` |
-| `USB_RTL8152` | ✅ 但为 2019 年老驱动 | 只认 RTL8153 千兆，不认 RTL8156 2.5G |
-| `USB_NET_CDC_NCM` | ❌ | 2.5G 网卡没有通用兜底 |
-
-**结论**：
-- **Track A（原厂内核）**：只能跑“降级的 IPv4 chroot” + 千兆网卡。先跑通这个，零刷机风险。
-- **Track B（自定义内核）**：PID/IPC/USER 命名空间、nftables、RTL8156 2.5G 全部打开；原生 IPv6 在 Track A 就能做，不需要 NAT66。
+| 源码 | OnePlusOSS `oneplus/sm8350_u_14.0.0_oneplus9`（Linux 5.4.254） |
+| 配置基线 | 从官方 `LE2120_14.0.0.1901` 的 `boot.img` 提取的真实运行配置 |
+| 编译器 | Android Clang 11.0.2 `r383902b1` + GCC 4.9 交叉工具链 |
+| 2.5G 驱动 | Realtek `r8152` v2.22.1，内置（`CONFIG_USB_RTL8152=y`） |
+| localversion | `-qgki-gd2a1055adeb0`，与原厂模块 vermagic 对齐 |
+| 重定位格式 | `CONFIG_RELR=n`（保持原厂 RELA） |
+| KABI 闸门 | 1,607 个符号，99 个原厂模块，100% 匹配才允许打包 |
 
 ---
 
-## 二、把工程推到 GitHub
+## 2. 内核配置：为什么这样选
 
-本地的 `kernel/`、`modules_and_devicetree/`、`firmware_LE2120_*/`、`payload.bin`、`output/`、`.tmp/`、`openwrt_rootfs/`、`toolchain/` 都已在 `.gitignore` 中排除。**不要把这些大文件推上去**；工作流会在云端自己克隆内核源码。
+### 2.1 硬约束：KABI
 
-```powershell
-cd C:\path\to\sm8350_lahaina
-git init
-git add .
-git commit -m "OnePlus 9 Pro OpenWrt kernel build"
-```
-
-在 GitHub 新建一个仓库（Private 也可以），然后：
-
-```powershell
-git remote add origin https://github.com/<你的用户名>/<仓库名>.git
-git branch -M main
-git push -u origin main
-```
-
-推送前可以检查一下将要提交的文件大小：
-
-```powershell
-git ls-files | ForEach-Object { Get-Item $_ } | Sort-Object Length -Descending | Select-Object -First 20 Name, Length
-```
-
----
-
-## 三、触发云端编译
-
-1. 打开 GitHub 仓库 → **Actions**；
-2. 左侧选择 **Build OnePlus 9 Pro 5.4 Kernel (OpenWrt + RTL8156B)**；
-3. 右侧 **Run workflow** → **Run workflow**；
-4. 等待 30~90 分钟（首次要克隆内核 + 下载工具链 + LTO 编译）。
-
-工作流会做这些事：
-
-- 下载 Clang **r383902b1** + GCC 4.9 交叉工具链；
-- 克隆 OnePlusOSS 内核源码；
-- 克隆 `modules_and_devicetree`，把 `vendor`、`techpack`、`device` 覆盖进内核树，保持与官方源码布局一致；
-- 用 `drivers/r8152/` 替换内核里的老 `r8152.c`；
-- 以 `configs/stock_le2120_1901.config` 为基线，打开容器、netfilter、2.5G 选项；
-- **强制校验**关键配置，缺一个就失败（避免刷进去才发现没开）；
-- 编译 `Image`；
-- 额外编译一个 `r8152_2p5g.ko` 给原厂内核做 Magisk 兜底；
-- 打包 AnyKernel3 和 Magisk 模块。
-
-产物在运行页最下方的 **Artifacts**：
+手机里有 99 个预编译厂商模块（`vendor_dlkm`、`vendor_boot` 等），它们用 `__versions` 记录每个导出符号的 CRC。内核只要改动结构体布局或导出符号集合，CRC 就会变化，模块会报：
 
 ```text
-OnePlus9Pro-OpenWrt-Kernel-<run_number>
-├── AnyKernel3-OnePlus9Pro-OpenWrt-5.4.zip
-├── r8152-2.5G-Magisk-Module.zip
-├── Image
-├── r8152_2p5g.ko
-└── stock-config-used.txt
+disagrees about version of symbol ...
+Unknown symbol ...
 ```
+
+因此本项目把 **1,607 个符号 CRC** 作为硬闸门。`scripts/verify_kabi_crc.py` 在 GitHub Actions 里执行，任何缺失/不匹配都会让构建失败。
+
+黄金表：`configs/phone_kabi_crc.json`。
+
+### 2.2 开启的选项（KABI 安全）
+
+```text
+CONFIG_NAMESPACES=y
+CONFIG_UTS_NS=y
+CONFIG_PID_NS=y            # 容器内 procd 当 PID 1
+CONFIG_NET_NS=y            # 已有
+CONFIG_DEVTMPFS=y          # 容器 /dev
+CONFIG_MACVLAN=y           # 备用网络方案
+CONFIG_VETH=y              # 已有
+CONFIG_BRIDGE=y            # 已有
+CONFIG_TUN=y               # Clash TUN 等
+CONFIG_OVERLAY_FS=y        # 已有
+CONFIG_IP_NF_IPTABLES=y
+CONFIG_IP_NF_NAT=y
+CONFIG_IP_NF_TARGET_MASQUERADE=y
+CONFIG_IP6_NF_IPTABLES=y
+CONFIG_IP6_NF_NAT=y        # 开启但当前不用于 NAT66
+CONFIG_NETFILTER_XT_TARGET_TPROXY=y
+CONFIG_NETFILTER_XT_MATCH_SOCKET=y
+CONFIG_USB_RTL8152=y       # 内置 2.5G
+CONFIG_USB_NET_CDC_NCM=y
+CONFIG_USB_NET_AQC111=y
+CONFIG_USB_NET_AX88179_178A=y
+CONFIG_OPLUS_FINGERPRINT*=y
+```
+
+### 2.3 保持关闭的选项（会动 ABI / 当前不需要）
+
+| 选项 | 状态 | 原因 |
+| :--- | :---: | :--- |
+| `CONFIG_NF_TABLES` | ❌ | 会改动 netfilter 相关结构，且 21.02 用 `fw3` 不需要 |
+| `CONFIG_BRIDGE_NETFILTER` | ❌ | 改动 `sk_buff` / bridge 结构，KABI 风险 |
+| `CONFIG_VLAN_8021Q` | ❌ | 当前不用 VLAN，避免结构体变化 |
+| `CONFIG_SYSVIPC` | ❌ | 会引入 `IPC_NS` 相关布局变化 |
+| `CONFIG_USER_NS` | ❌ | 不需要，且增加攻击面 |
+| `CONFIG_RELR` | ❌ | 原厂用 RELA，开了会导致模块重定位不兼容 |
+
+> `CONFIG_IP6_NF_NAT=y` 只是保留了能力；当前 IPv6 方案是原生 `/64` 共享，**没有 NAT66**。
+
+### 2.4 原厂内核 vs 自定义内核
+
+| 能力 | 原厂 | 自定义 |
+| :--- | :---: | :---: |
+| `PID_NS` | ❌ | ✅ |
+| `DEVTMPFS` | ❌ | ✅ |
+| `MACVLAN` | ❌ | ✅ |
+| `IP6_NF_NAT` | ❌ | ✅（未使用） |
+| 原生 IPv6 `/64` | ✅ | ✅ |
+| RTL8156 2.5G | ❌（旧 r8152） | ✅ 内置 v2.22.1 |
+| OPlus 指纹驱动 | ✅（旧命名） | ✅（`OPLUS_*` 命名） |
+| `NF_TABLES` / `fw4` | ❌ | ❌ |
+| KABI 兼容原厂模块 | — | ✅ 1,607/1,607 |
 
 ---
 
-## 四、刷入自定义内核（Track B，实验性）
+## 3. 云端构建
 
-> **建议先完成第五节的“原厂内核 + r8152 模块”方案**，确认 5G 和 OpenWrt 容器都正常后，再尝试本节。自定义内核缺少完整的 OPLUS 内置代码，属于实验性路线；刷之前务必用 `scripts/01_backup_partitions.sh` 备份，并确认电脑里有原厂 `boot.img`。
+GitHub Actions → **Build OnePlus 9 Pro 5.4 Kernel (OpenWrt + RTL8156B)** → **Run workflow**。
 
-### 推荐：Kernel Flasher
+工作流会：
+
+1. 下载 Clang `r383902b1` + GCC 4.9 工具链；
+2. 克隆 OnePlusOSS 内核与 `modules_and_devicetree`，覆盖 `vendor` / `techpack` / `device`；
+3. 用 `drivers/r8152/` 替换内核里的旧 `r8152.c`；
+4. 以 `configs/stock_le2120_1901.config` 为基线，打开第 2 节的选项；
+5. 强制检查关键 `CONFIG_*`，缺一个就失败；
+6. 编译 `Image`；
+7. **执行 KABI CRC 校验**，失败即终止；
+8. 额外编译 `r8152_2p5g.ko` 兜底模块；
+9. 打包 AnyKernel3 与 Magisk 模块。
+
+必须看到：
+
+```text
+KABI check: vmlinux exports=..., required by phone modules=1607
+  matched   : 1607/1607
+  missing   : 0
+  mismatched: 0
+SUCCESS: 100% KABI CRC match with all 99 stock phone modules!
+```
+
+产物在 Actions 运行页最下方 **Artifacts**。
+
+---
+
+## 4. 刷入自定义内核
+
+### 4.1 推荐：Kernel Flasher + AnyKernel3
 
 1. 把 `AnyKernel3-OnePlus9Pro-OpenWrt-5.4.zip` 传到手机；
 2. 打开 **Kernel Flasher**；
-3. 选择该 zip → 刷入 → 重启。
+3. 选择 zip → 刷入 → 重启。
 
 AnyKernel3 会：
 
-- 自动识别 A/B 槽位（`IS_SLOT_DEVICE=1`）；
-- `dump_boot` 解包当前 `boot.img`；
-- 替换其中的 kernel；
+- 识别 A/B 槽位（`IS_SLOT_DEVICE=1`）；
+- `dump_boot` 解包当前 boot；
+- 只替换 kernel；
 - `write_boot` 重新打包并写回。
 
-**它保留原来的 20.47 MiB ramdisk，所以 Magisk 补丁不会掉。**
+**它保留原 boot 的 ramdisk，所以 Magisk 不会掉。**
 
-### 不要做的事
+### 4.2 直接 fastboot 刷完整 boot
 
-- **不要** `fastboot flash boot Image`：`Image` 只是内核二进制，不是 boot 镜像；
-- **不要**用 `fastboot flash boot` 直接刷 AnyKernel3 的 zip；
-- 如果你要刷原始 `boot.img`，必须先在备用机上用 Magisk 打好补丁。
+如果已经有打包好的 `new-boot-custom-v3.img`（Magisk ramdisk + 自定义内核）：
 
-### 刷完验证
+```powershell
+$fb = ".tmp\platform-tools-34\platform-tools\fastboot.exe"
+& $fb getvar current-slot
+& $fb flash boot_a artifacts\kernel_run4\new-boot-custom-v3.img
+& $fb reboot
+```
+
+> **不要** `fastboot flash boot Image`：`Image` 只是裸内核，不是 boot 镜像。
+> **不要** `fastboot flash boot AnyKernel3-*.zip`：zip 不是分区镜像。
+
+### 4.3 刷完验证
 
 ```bash
 adb shell uname -r
 # 期望：5.4.254-qgki-gd2a1055adeb0
 
 adb shell su -c "dmesg | grep -i r8152"
+adb shell su -c "grep r8152 /proc/kallsyms | head"
 adb shell su -c "lsusb"
-adb shell su -c "ip link"
-
-# 插上 2.5G 网卡后：
-adb shell su -c "dmesg | grep -iE 'r8152|rtl8156'"
 adb shell su -c "ip -br link"
+
+# PID namespace
+adb shell su -c "/data/adb/magisk/busybox unshare -p -f sh -c 'echo pid_inside_ns=\$\$'"
+# 期望：pid_inside_ns=1
+
+# 指纹
+adb shell dumpsys fingerprint | head -20
+adb shell ls -l /dev/goodix_fp
 ```
 
-如果 2.5G 网卡被识别，`ip link` 里会出现 `eth0`（或 `usb0`），`dmesg` 会打印 `Realtek RTL8152/RTL8153 Based USB Ethernet Adapters v2.22.1`。
+插上 2.5G 网卡后，`ip -br link` 应出现 `eth0`，`dmesg` 应打印：
+
+```text
+Realtek RTL8152/RTL8153 Based USB Ethernet Adapters v2.22.1
+```
 
 ---
 
-## 五、零刷机方案：原厂内核 + r8152 模块（推荐先做）
+## 5. 原厂内核兜底（可选，非当前路线）
 
-这是**首选方案**，也是 2.5G 驱动最安全的落地方式：
+如果只想零刷机验证，可用原厂内核 + `r8152-2.5G-Magisk-Module.zip`：
 
-1. 在 GitHub Actions 里运行 **`Build r8152 2.5G Module for Stock Kernel`**；
-2. 下载 `r8152-2.5G-Magisk-Module.zip`；
-3. 传到手机，在 **Magisk App → 模块 → 从本地安装** 中选择该 zip；
-4. 重启；
-5. 插上 2.5G 网卡，检查：
+1. GitHub Actions → **Build r8152 2.5G Module for Stock Kernel**；
+2. 下载 zip → Magisk App → 模块 → 从本地安装；
+3. 重启，检查 `lsmod | grep r8152`。
 
-```bash
-adb shell su -c "lsmod | grep r8152"
-adb shell su -c "dmesg | grep -i r8152"
-adb shell su -c "ip -br link"
-```
+模块里的驱动名是 `r8152_2p5g`，避免和原厂内置 `r8152` 冲突。
 
-模块里的驱动名是 `r8152_2p5g`，不会和原厂内置的 `r8152` 冲突。原厂内置驱动不认 `0x8156`，所以新驱动能绑定 2.5G 网卡。
+限制：
 
-> 注意：这个兜底依赖内核符号 CRC 与 vermagic 完全匹配。如果 `insmod` 报
-> `disagrees about version of symbol`，说明原厂内核的符号版本与我们的构建不一致，
-> 这种情况只能用 Track B 的完整自定义内核。
+- 原厂内核没有 `PID_NS`，`procd` 不能安全当 PID 1；只能做降级的 mount/net/UTS chroot，或者用别的 init；
+- 原厂内核没有 `DEVTMPFS`，需要 bind-mount `/dev`；
+- 仍然没有 `NF_TABLES`，只能用 21.02 `fw3`；
+- 模块依赖 vermagic / 符号 CRC 完全匹配，`insmod` 报 `disagrees about version of symbol` 就说明不匹配。
+
+当前手机已改用内置 `r8152` 的自定义内核，Magisk 模块已卸载。
 
 ---
 
-## 六、部署 OpenWrt
+## 6. 部署 OpenWrt
 
 ### 6.1 选择 rootfs
 
-| 路线 | rootfs | 防火墙 |
+| rootfs | 防火墙 | 状态 |
 | :--- | :--- | :--- |
-| Track A（原厂内核） | `openwrt-21.02.7-armvirt-64-default-rootfs.tar.gz` | `fw3` + `iptables-legacy` |
-| Track B（自定义内核） | `openwrt-23.05.5-armsr-armv8-rootfs.tar.gz` | `fw4` + `nftables` |
+| `openwrt-21.02.7-armvirt-64-default-rootfs.tar.gz` | `fw3` + `iptables-legacy` | ✅ **当前使用** |
+| `openwrt-22.03.7-armvirt-64-default-rootfs.tar.gz` | `fw4` + nftables | ❌ 内核无 `NF_TABLES`，默认不可用 |
+| `openwrt-23.05.5-armsr-armv8-rootfs.tar.gz` | `fw4` + nftables | ⚠️ 需禁用 `fw4` 并改用 `option device`，未正式采用 |
+| OpenWrt 24.10+ | `fw4` + `apk` | ⚠️ 需改包管理，未验证 |
 
-两个包都已下载到本地的 `openwrt_rootfs/`。
+> 22.03+ 不是“内核版本不兼容”，而是 **默认防火墙栈不兼容**。要上 23.05，必须 `fw4` 不启动，LAN 侧防火墙/NAT 继续由宿主或 iptables 承担。
 
 ### 6.2 推送到手机
 
-`/data/openwrt` 是 root 目录，不能直接 `adb push`；先推到 `/data/local/tmp`，再用 `su` 归位。所有 OpenWrt 文件只放在 `/data/openwrt/` 下。
+`/data/openwrt` 是 root 目录，不能直接 `adb push`；先推到 `/data/local/tmp`，再用 `su` 归位。
 
 ```powershell
 # 1) 推送到临时目录
@@ -234,13 +269,16 @@ adb shell su -c "chmod 755 /data/adb/service.d/00_openwrt.sh"
 adb shell su -c "sh /data/openwrt/scripts/03_setup_openwrt_rootfs.sh"
 ```
 
-脚本会：
+`03` 会：
 
-- 解压到 `/data/openwrt/rootfs`；
+- 解压到 `/data/openwrt/rootfs`（**会先清空该目录**，升级前备份 `/etc/config` 和 `packages/`）；
 - 自动识别 21.02 / 23.05，选择 `option ifname` 或 `option device`；
-- 写入 `lan`（192.168.2.1/24）、`wan`（10.200.1.2/30）；IPv6 由 `04` 按运营商 /64 动态配置（不使用 NAT66）；
-- 写入 `firewall`（LAN→WAN 转发 + masq）和 `dhcp`；
-- 用假 `modprobe` 绕过 OpenWrt 的 kmod 依赖（驱动已编进内核）。
+- 写入 `lan`（`192.168.2.1/24`）、`wan`（`10.200.1.2/30`，网关 `10.200.1.1`）；
+- 写入 `firewall`（LAN→WAN 转发 + masq）和 `dhcp`（含 `config dnsmasq`、`odhcpd` RA）；
+- 添加 `Allow-Host-UI` 规则：只允许 `10.200.1.1` 访问容器 80/443；
+- 把 `uhttpd.rfc1918_filter` 设为 `0`，否则宿主从 veth 访问会被当公网地址拒绝；
+- 用假 `modprobe` 绕过 OpenWrt 的 kmod 依赖（驱动已编进内核）；
+- 修补 dropbear init 的 `mktemp -d` 缺陷（否则会 `mv /* /etc/dropbear` 搬空 rootfs）。
 
 ### 6.4 启动容器与网络
 
@@ -248,85 +286,192 @@ adb shell su -c "sh /data/openwrt/scripts/03_setup_openwrt_rootfs.sh"
 adb shell su -c "sh /data/openwrt/scripts/04_start_openwrt_and_network.sh"
 ```
 
-脚本会：
+`04` 会：
 
-- 用 `unshare` 创建 mount/UTS/net 命名空间（自定义内核额外加 PID/IPC）；
-- bind-mount `/dev`、`/dev/pts`、`/sys`、`/proc`；
-- 用 **Magisk BusyBox 的 `ip`** 把 USB 网卡移进容器 netns（Android toybox 的 `ip` 不支持 `netns`）；
-- 创建 `veth-host` / `veth-owrt`，配置 10.200.1.1 ↔ 10.200.1.2；
-- 用**数字路由表 100** 绕过 Android netd（不再使用错误的 `lookup rmnet_data0`）；
-- 配置宿主机 `iptables` MASQUERADE 与 FORWARD；
-- 自动优先使用 `v4-rmnet_data0`（IPv6-only 运营商的 clat 接口）。
-
-启动后，电脑插网线到 USB 网卡，访问：
+1. 校验 `PID_NS`，没有就直接拒绝启动（避免 `procd` 在宿主 PID namespace 里当前 PID 1）；
+2. `unshare -m -u -n -p -f`，`chroot` 到 `/data/openwrt/rootfs`，启动 `/sbin/init`；
+3. bind-mount `/dev`、`/dev/pts`、`/sys`，挂载独立 `/proc`；
+4. 把 USB 网卡（`eth0` / `usb0` / `eth1`）移进容器 netns，改名为 `eth0`；
+5. 创建 `veth-host` ↔ `veth-owrt`，配置 `10.200.1.1/30` ↔ `10.200.1.2/30`；
+6. 容器默认路由 `via 10.200.1.1`；
+7. 宿主开启 `ip_forward` / IPv6 forwarding，关闭相关 `rp_filter`；
+8. 宿主 `iptables` MASQUERADE + FORWARD；
+9. 建 IPv4 表 100：
 
 ```text
-http://192.168.2.1
+default via <5G网关> dev <rmnet>        # 5G 默认
+10.200.1.0/30 dev veth-host            # 直连，必须存在
 ```
+
+10. 策略路由：
+
+```text
+90:  to 10.200.1.0/30 lookup main      # 宿主访问容器（LuCI/SSH）
+100: from 10.200.1.0/30 lookup 100     # 容器出站走 5G
+101: iif <rmnet> to 10.200.1.0/30 lookup main   # 回程
+```
+
+11. IPv6：
+    - 从 `rmnet` 读取全局 `/64`；
+    - 容器 `eth0` 配 `::1/64`；
+    - `veth-host` `fe80::1`，`veth-owrt` `fe80::2`，容器默认 `via fe80::1`；
+    - 宿主 table 200：`<prefix>/64 dev veth-host`；rule `iif <rmnet> lookup 200 pref 1000`；
+    - 宿主 table 201：5G IPv6 默认；rule `from <prefix> lookup 201 pref 1001`；
+    - 容器内 `odhcpd` 发 RA，客户端 SLAAC。
 
 ### 6.5 开机自启
 
-```bash
-adb shell su -c "sh /data/adb/service.d/00_openwrt.sh &"
+唯一入口：
+
+```text
+/data/adb/service.d/00_openwrt.sh
 ```
 
-或者直接重启手机，Magisk 会执行 `/data/adb/service.d/00_openwrt.sh`（唯一入口）。自启脚本会：
+内容只有一行：
 
-- 先启动 CPU/充电守护（cpu7 离线、50–60% 停充）；
-- 等待 5G 数据接口拿到 IP；
-- 等待 USB 网卡 `eth0`（最多 60 秒）；
-- 如果容器没在跑，自动执行 `04`；
-- 每 30 秒检查容器是否存活，并重新确保 `ip_forward` / 策略路由（Android netd 会重置它们）。
+```sh
+#!/system/bin/sh
+exec sh /data/openwrt/scripts/service_openwrt_autorun.sh
+```
+
+自启脚本会：
+
+1. 先启动电源守护（cpu7 离线、50–60% 停充）；
+2. 等 `sys.boot_completed=1`；
+3. 等 5G 默认路由（最多 120 秒）；
+4. 等 USB 网卡 `eth0`（最多 60 秒）；
+5. 容器没跑就执行 `04`；
+6. 每 30 秒看门狗：
+   - 重新确保 `ip_forward` / IPv6 forwarding；
+   - 重新确保 table 100、rule 90/100/101；
+   - 容器挂了自动重启；
+   - 电源守护挂了自动拉起。
+
+临时禁用自启（不删入口）：
+
+```bash
+adb shell su -c "touch /data/openwrt/disable_autorun"
+```
+
+恢复：
+
+```bash
+adb shell su -c "rm -f /data/openwrt/disable_autorun"
+```
+
+### 6.6 访问地址
+
+| 来源 | 地址 |
+| :--- | :--- |
+| 电脑接 USB 网卡（LAN） | `http://192.168.2.1/` |
+| 手机浏览器（veth WAN） | `http://10.200.1.2/` |
+| SSH（LAN） | `ssh root@192.168.2.1` |
+
+> 容器的 `localhost` 和 Android 的 `localhost` 不是同一个 netns；手机浏览器不能用 `localhost:443`。
 
 ---
 
-## 七、回滚
+## 7. 验证清单
 
-### 自定义内核刷失败 / 开不了机
-
-1. 长按 **音量下 + 电源** 进 Fastboot；
-2. 刷回原厂 boot：
+### 7.1 宿主
 
 ```bash
-fastboot flash boot firmware_LE2120_14.0.0.1901\boot.img
-fastboot reboot
+adb shell su -c "cat /proc/sys/net/ipv4/ip_forward"          # 1
+adb shell su -c "ip rule | head -8"                          # 90/100/101
+adb shell su -c "ip route show table 100"                    # 5G default + veth link
+adb shell su -c "ip -6 rule | head -8"                       # pref 1000/1001
+adb shell su -c "iptables -t nat -S POSTROUTING | grep 10.200.1"
 ```
 
-如果是 A/B 槽位问题：
+### 7.2 容器
 
 ```bash
-fastboot getvar current-slot
-fastboot flash boot_a firmware_LE2120_14.0.0.1901\boot.img
-fastboot flash boot_b firmware_LE2120_14.0.0.1901\boot.img
+P=$(cat /data/openwrt/run/container.pid)
+BB=/data/adb/magisk/busybox
+$BB nsenter -t "$P" -m -u -n -p -- /system/bin/chroot /data/openwrt/rootfs /bin/sh -c '
+  export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+  ps | head
+  ip -4 addr show eth0
+  ip -4 addr show veth-owrt
+  ip -6 addr show eth0
+  ip route
+  ip -6 route
+  ping -c 2 223.5.5.5
+'
 ```
 
-3. 如果 Fastboot 也进不去，按 `RECOVERY_AND_ROLLBACK.md` 走 9008 救砖。
+### 7.3 宿主导航到 LuCI
 
-### Magisk 模块兜底失败
+```bash
+/data/adb/magisk/busybox wget -O - http://10.200.1.2/ | head
+```
 
-在 Magisk App → 模块 → 卸载 `OnePlus 9 Pro RTL8156B 2.5G USB NIC`，重启即可。它不会改分区。
+应返回 200 和跳转到 `cgi-bin/luci/` 的页面。
 
 ---
 
-## 八、已知限制与排错
+## 8. 实测缺陷与修复
 
-1. **6GHz Wi-Fi 开不了**：一加9 Pro 全系没有 6GHz FEM/滤波器，FCC 也只认证到 5.85GHz；Root 改国家码无效。
-2. **自定义内核属于实验性**：`CONFIG_OPLUS_*` 的主内核部分在 `init/Kconfig` 等主 Kconfig 里，`OplusKernelEnvConfig.mk` 会根据 `BRAND_SHOW_FLAG=oneplus` 定义 `OPLUS_FEATURE_*` C 宏；工作流已经设置该变量，所以 OPLUS 的调度/锁/内存/显示核心会保留，C 宏和结构体布局与 Stock 一致。真正可能缺的是 `vendor/oplus` 里的厂商驱动/模块（触控、快充、部分性能扩展），以及预编译 `vendor_dlkm` 模块的 ABI 兼容性。5G/USB/UFS/显示由主内核和 Qualcomm 驱动提供，通常可用；Wi-Fi/音频/相机/触控/快充这些模块可能报 vermagic/unknown symbol 错误。**生产环境优先用“原厂内核 + r8152 模块”**；自定义内核只作为打开 PID_NS/nftables 的实验路线。
-3. **原生 IPv6 不需要 NAT66**：运营商 /64 通过同前缀转发/NDP 共享给 LAN；原厂内核也能做。NAT66 已从脚本移除。
-4. **2.5G 网卡芯片**：推荐 RTL8156B/BG；初代 RTL8156 也能驱动但发热大；RTL8153/AX88179 千兆原厂内核就支持。
-5. **`iptables` 后端**：原厂内核没有 nftables，宿主机必须用 `iptables-legacy`；`04` 脚本会自动检测并回退。
-6. **Android netd 会重置规则**：如果发现断网，重新执行 `04`，或把 `service_openwrt_autorun.sh` 作为守护进程运行。
-7. **首次开机慢**：内核带 LTO/CFI，首次启动可能比原厂慢几秒，正常。
+| 现象 | 根因 | 修复 |
+| :--- | :--- | :--- |
+| 容器启动后 rootfs 被搬空 | BusyBox `mktemp -d` 无模板，`tdir` 为空，dropbear init 执行 `mv /* /etc/dropbear` | `03` 强制 `mktemp -d /tmp/dropbear.XXXXXX` 并给 `mv` 加保护 |
+| dnsmasq 不启动 | `/etc/config/dhcp` 只有 `config dhcp`，缺 `config dnsmasq` | `03` 补全 dnsmasq 全局段 |
+| IPv6 LAN 地址刚加就被刷掉 | `network reload` 异步执行，随后 flush | `04` 等 netifd 稳定后再加地址，并 `sleep 2` |
+| `ip addr replace` 报错 | Android toybox `ip` 不支持 `replace` | 改用 `ip addr add` |
+| 重启容器时找不到 eth0 | 旧容器还持有 netns，探测过早 | 先停旧容器，再重新探测网卡 |
+| `ip_forward` 被重置 | Android netd 在网络变化时重置 | 自启看门狗每 30 秒重新断言 |
+| 宿主能 ping 容器但 TCP 不通 | table 100 缺 `10.200.1.0/30 dev veth-host` 直连路由 | `04` 显式添加 |
+| 宿主访问 `10.200.1.2` 走 5G | 默认路由优先，`from 10.200.1.0/30` 规则匹配不到宿主自身流量 | 增加 `ip rule add to 10.200.1.0/30 lookup main pref 90` |
+| 手机浏览器打不开 LuCI | uhttpd 的 RFC1918 过滤把 veth 私网当公网拒绝 | `rfc1918_filter=0` + 仅允许 `10.200.1.1` 的防火墙规则 |
+| LuCI 中文装不上 | opkg 索引架构文件名不匹配 | 手工安装 `luci-base` / `luci-i18n-*-zh-cn`，设置 `luci.main.lang=zh-cn` |
+| 电源守护不生效 | PID 文件跨重启残留，PID 被复用 | 校验 `/proc/<pid>/cmdline` 确实是守护进程 |
+| 迁移路径后新守护不启动 | 旧守护仍以已删除路径运行，PID 文件有效 | 杀掉旧进程、清 pid、重启守护 |
+| 看门狗只拉容器不拉守护 | 自启循环缺守护检查 | 每 30 秒调用 `service_power_guard.sh` |
+| 开机“设备内部出现问题” | 内核缺 `CONFIG_OPLUS_FINGERPRINT*`，`fps_hal` 崩溃循环 | 打开 OPlus 指纹驱动；一次性提示点掉后不再出现 |
+
+更完整的测试记录见 **[`TEST_REPORT.md`](TEST_REPORT.md)**。
 
 ---
 
-## 九、构建失败时看哪里
+## 9. 回滚
 
-GitHub Actions 运行页 → 失败的那一步 → 展开日志。重点看：
+详见 **[`RECOVERY_AND_ROLLBACK.md`](RECOVERY_AND_ROLLBACK.md)**。最快路径：
 
-- `Prepare config`：哪个 `CONFIG_*` 没开；
+```powershell
+$fb = ".tmp\platform-tools-34\platform-tools\fastboot.exe"
+& $fb flash boot_a magisk_patch\magisk_patched_boot_v30.7.img
+& $fb reboot
+```
+
+这只回滚内核，不动数据分区。OpenWrt 容器故障通常不需要刷机，删掉 `/data/adb/service.d/00_openwrt.sh` 或 `touch /data/openwrt/disable_autorun` 即可。
+
+---
+
+## 10. Android OTA 与 KABI 复验
+
+Android OTA 会覆盖 `boot`（自定义内核丢失）和 `vbmeta_a`（AVB 重新启用）。**是否需要重编内核，取决于新固件 vendor 模块的符号 CRC。**
+
+流程：
+
+1. 从新固件解包 `vendor_dlkm` / `vendor_boot` 里的 `.ko`；
+2. 解析每个 `.ko` 的 `__versions`，生成新的 CRC 表；
+3. 与当前 `artifacts/kernel_run4/Module.symvers` 对比；
+4. 结果：
+   - **1,607 个符号全部匹配** → 直接用现有 `Image` 重新打包 Magisk boot，刷 `boot_a`，**不用重编**；
+   - **任意不匹配** → 必须按新固件源码重编内核，并重新跑 KABI 闸门。
+
+当前黄金表 `configs/phone_kabi_crc.json` 对应 `LE2120_14.0.0.1901`。换固件后要重新生成。
+
+---
+
+## 11. 构建失败排查
+
+GitHub Actions 运行页 → 失败步骤 → 展开日志：
+
+- `Prepare KABI-safe config`：哪个 `CONFIG_*` 没开；
 - `Compile kernel Image`：第一个 `error:`；
-- `Build out-of-tree r8152_2p5g.ko`：`insmod`/CRC 相关问题；
+- `Verify 100% KABI CRC`：哪个符号 `MISSING` / `MISMATCH`；
+- `Build out-of-tree r8152_2p5g.ko`：vermagic / CRC 问题；
 - `Package AnyKernel3`：`Image` 是否生成。
 
-把失败日志发给我，我按具体错误改工作流。
+KABI 失败时不要绕过闸门——刷进去会导致原厂模块拒绝加载，手机可能卡开机。

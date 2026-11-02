@@ -4,11 +4,11 @@
 # Start the OpenWrt chroot, move the USB LAN NIC into its netns, create a veth
 # WAN pair, and route the container through the Android 5G modem.
 #
-# Track A (stock kernel): mount+UTS+net namespaces; IPv4 only.
-# Track B (custom kernel): mount+UTS+net+PID+IPC; IPv4 now, native IPv6 later.
+# Track A (stock kernel): mount+UTS+net namespaces, no PID namespace.
+# Track B (custom kernel): adds PID namespace; IPv4 + native IPv6 /64.
 #
-# IPv6 design note: do NOT use NAT66. Native IPv6 requires the carrier /64
-# to be shared with the LAN via NDP proxy / prefix sharing; see IPV6_NOTES.md.
+# IPv6 design note: do NOT use NAT66. Share the carrier /64 with the LAN via
+# routing + RA; see IPV6_NOTES.md.
 #
 # Run as root (adb shell su -c "sh /data/openwrt/scripts/04_start_openwrt_and_network.sh").
 # ==============================================================================
@@ -51,7 +51,8 @@ log "busybox: $BB"
 # created one (IPv6-only carrier + 464XLAT).
 # ------------------------------------------------------------------------------
 # Pick the interface that actually carries the default IPv4 route.
-# On this phone the active 5G PDN is rmnet_data1, not rmnet_data0.
+# The active 5G PDN is not fixed: it may be rmnet_data0, rmnet_data1,
+# rmnet_data2, etc. depending on the carrier/SIM state.
 RMNET_IF=$(ip route get 8.8.8.8 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')
 case "$RMNET_IF" in
     rmnet*|v4-rmnet*) ;;
@@ -71,7 +72,7 @@ log "5G WAN (IPv4): $RMNET_IF"
 # ------------------------------------------------------------------------------
 # Native IPv6 prefix detection. We share the carrier /64 with the LAN (same as
 # Android hotspot) instead of using NAT66. Only /64 is handled:
-#   rmnet_data1: 2001:db8:1234:5678:..../64
+#   rmnet_dataX: 2001:db8:1234:5678:..../64
 #   LAN eth0:    2001:db8:1234:5678::1/64 + RA
 # ------------------------------------------------------------------------------
 V6_CIDR=""
@@ -90,9 +91,6 @@ if [ -n "$V6_CIDR" ]; then
     fi
 fi
 [ -n "$V6_NET" ] && log "Native IPv6 prefix: $V6_NET (no NAT66)" || log "WARN: no global /64 on $RMNET_IF; IPv6 LAN disabled"
-
-# Native IPv6 is not configured here. See IPV6_NOTES.md: no NAT66.
-# (The carrier /64 must be shared via NDP proxy / prefix sharing.)
 
 # ------------------------------------------------------------------------------
 # Find the USB NIC.
@@ -261,9 +259,9 @@ echo 0 > /proc/sys/net/ipv4/conf/all/rp_filter 2>/dev/null
 echo 0 > "/proc/sys/net/ipv4/conf/$VETH_HOST/rp_filter" 2>/dev/null
 echo 0 > "/proc/sys/net/ipv4/conf/$RMNET_IF/rp_filter" 2>/dev/null
 
-# Native IPv6 forwarding: packets arriving from rmnet_data1 for the LAN /64
-# go to veth-host (table 200), not back out rmnet_data1. Packets to the host's
-# own address in the /64 are caught by the local table (rule 0) first.
+# Native IPv6 forwarding: packets arriving from the 5G interface for the LAN /64
+# go to veth-host (table 200), not back out the 5G interface. Packets to the
+# host's own address in the /64 are caught by the local table (rule 0) first.
 if [ -n "$V6_NET" ]; then
     echo 1 > /proc/sys/net/ipv6/conf/all/forwarding
     echo 1 > "/proc/sys/net/ipv6/conf/$RMNET_IF/forwarding" 2>/dev/null
@@ -320,8 +318,8 @@ ip rule add iif "$RMNET_IF" to "$HOST_NET" lookup main pref 101
 ip rule del pref 90 2>/dev/null
 ip rule add to "$HOST_NET" lookup main pref 90
 
-# IPv6: intentionally not configured yet. Do not add NAT66 here.
-# Native IPv6 requires sharing the carrier /64 via NDP proxy; see IPV6_NOTES.md.
+# IPv6: configured in the host-forwarding block above via native /64 sharing.
+# Do not add NAT66 here.
 
 # ------------------------------------------------------------------------------
 # Host NAT. Stock kernel has no nftables; prefer iptables-legacy.

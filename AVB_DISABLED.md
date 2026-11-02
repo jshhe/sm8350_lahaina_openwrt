@@ -6,6 +6,7 @@
 - 结果：`vbmeta_a` flags = `0x00000003`
   - bit 0 `VERIFICATION_DISABLED`
   - bit 1 `HASHTREE_DISABLED`
+- 当前状态（2026-11）：仍为 `0x3`，自定义内核与 Magisk 正常工作
 
 ## 刷写命令
 
@@ -44,13 +45,16 @@ Magisk 30.7 Root 正常。
 ```powershell
 $fb = ".tmp\platform-tools-34\platform-tools\fastboot.exe"
 & $fb flash vbmeta_a "firmware_LE2120_14.0.0.1901\vbmeta.img"
-# 或者用原始分区备份：
-& $fb flash vbmeta_a "full_backup_LE2120_14.0.0.1901\vbmeta_a.img"
+# 或者用合并后的恢复集：
+& $fb flash vbmeta_a "backup_merged_LE2120_14.0.0.1901\vbmeta_a.img"
 ```
+
+> 恢复官方 vbmeta 后，AVB 会重新启用。只要 Bootloader 仍解锁，自定义内核 + Magisk 仍可启动；但如果要回锁 Bootloader，必须先恢复所有官方分区。
 
 ## 注意
 
-1. **OTA 会覆盖 vbmeta_a**，升级后 AVB 会重新启用，需要重新执行上面的刷写命令。
+1. **OTA 会覆盖 `vbmeta_a`**，升级后 AVB 会重新启用，需要重新执行上面的刷写命令。
 2. **不要在 vbmeta 被修改的情况下重新锁 Bootloader**，否则签名校验失败可能无法开机。回锁前先刷回官方 vbmeta。
 3. B 槽的 `vbmeta_b` 没有动，仍是旧版官方状态；当前只对活动槽 A 关闭了 AVB。
 4. platform-tools 34.0.4 保留在 `.tmp\platform-tools-34\`，以后刷 vbmeta 直接用它。
+5. 备份与回滚的完整流程见 [`RECOVERY_AND_ROLLBACK.md`](RECOVERY_AND_ROLLBACK.md)。

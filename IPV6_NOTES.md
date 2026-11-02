@@ -1,60 +1,167 @@
-# IPv6 设计说明：同 /64 原生共享，不用 NAT66
+# IPv6 设计说明：同 `/64` 原生共享，不做 NAT66
 
-## 实测证据（2026-10-25，中国移动 5G + 热点）
+## 1. 结论
 
-插卡开热点后，手机侧：
+一加 9 Pro 的 5G 是**单 UE**。运营商通常只给一个 `/64`，正确做法和 Android 热点一致：
 
-```text
-rmnet_data1: 2001:db8:1234:5678::a1b2/64    (5G 上游)
-wlan2:       2001:db8:1234:5678::c1/64      (热点 AP)
-client:      2001:db8:1234:5678::2/64       (下级设备)
-```
+- 上游 `rmnet_dataX` 持有运营商 `/64`；
+- 容器 LAN `eth0` 配同一个 `/64` 的 `::1/64`；
+- `odhcpd` 在 LAN 发 RA，客户端 SLAAC 得到同前缀地址；
+- 宿主只做**IPv6 转发 + 策略路由**；
+- **不使用 NAT66，不使用 ULA**。
 
-> 注：上面的地址是文档示例前缀（RFC 3849 `2001:db8::/32`），
-> 不是实测的真实运营商前缀。
+这样 LAN 客户端拿到的是原生公网 IPv6，不需要地址转换。
 
-- 三者是**同一个 /64**
-- `ip6tables -t nat` 表根本不存在（原厂内核没有 IP6_NF_NAT）
-- `dumpsys tethering` 显示 IPv6 由 **BPF/硬件 offload** 在 `rmnet_data1` 和
-  `wlan2` 之间转发，客户端源地址保持不变
-- 下级 `test-ipv6.com` 10/10 通过
+---
 
-结论：Android 热点没有做 NAT66，而是把运营商的 /64 同时放在上游和 AP 上，
-按客户端地址做转发。我们的 OpenWrt 容器也应该这样做。
+## 2. 实测依据
 
-## 另一个关键修正
+### 2.1 Android 热点
 
-活动 5G 接口是 **`rmnet_data1`**，不是 `rmnet_data0`：
+插卡开热点时观察：
 
 ```text
-rmnet_data0: 只有 link-local，没有 IPv4/IPv6 全局地址
-rmnet_data1: 10.x.x.x/28 + 2001:db8:1234:5678:.../64 + 默认路由
+rmnet_dataX: 2001:db8:1234:5678::a1b2/64   (5G 上游)
+wlan2:       2001:db8:1234:5678::c1/64     (热点 AP)
+client:      2001:db8:1234:5678::2/64      (下级设备)
 ```
 
-`04_start_openwrt_and_network.sh` 已改为用 `ip route get 8.8.8.8` 选择
-真正承载默认路由的接口，避免选到空的 `rmnet_data0`。
+> 地址为 RFC 3849 示例前缀，不是真实运营商前缀。
 
-## 当前实现（04 脚本）
+- 三者是**同一个 `/64`**；
+- `ip6tables -t nat` 表不存在（原厂内核没有 `IP6_NF_NAT`）；
+- `dumpsys tethering` 显示 IPv6 由 **BPF / 硬件 offload** 在 `rmnet_dataX` 和 `wlan2` 之间转发，客户端源地址保持不变；
+- 下级 `test-ipv6.com` 10/10 通过。
 
-1. 从 `rmnet_data1` 读取全局 `/64`
-2. 容器 LAN `eth0` 配同 /64 的 `...::1/64`
-3. 容器 `veth-owrt` 用 `fe80::2`，默认路由指向宿主 `veth-host` 的 `fe80::1`
-4. 宿主加策略路由：
-   - `ip -6 rule add iif rmnet_data1 lookup 200 pref 1000`
-   - `table 200: 2409:...::/64 dev veth-host`
-   - 宿主自己的 /64 地址由 `local` 表（rule 0）优先命中
-5. 容器内 `odhcpd` 在 `eth0` 发 RA，客户端 SLAAC 拿到同 /64 地址
-6. 不做 NAT66、不使用 ULA
+结论：Android 热点没有做 NAT66，而是把运营商 `/64` 同时放在上游和 AP 上，按客户端地址转发。
 
-## 还需要实测的点
+### 2.2 OpenWrt 容器
 
-- 下级客户端能否通过 OpenWrt 正常拿到 `2409:...` 地址并上网
-- 运营商是否接受该 /64 内其他源地址（Android 热点已证明可以）
-- 如果运营商对每个地址做 NDP，需要在 `rmnet_data1` 上补 proxy NDP
-  （Android 用 offload，不需要内核 proxy；我们先按路由转发验证）
+实测结果：
 
-## 结论
+- PC 通过 USB 网卡获得运营商 `/64` 内的地址；
+- PC 可以 ping 容器 `eth0` 的 `::1`；
+- PC 可以 ping 外网 `2400:3200::1`；
+- 容器内 `odhcpd` 正常发 RA；
+- 没有配置任何 NAT66 规则。
 
-- NAT66 已从 `03`/`04` 删除
-- 原生 IPv6 不依赖 `IP6_NF_NAT`，**原厂内核也能做**
-- 自定义内核的 IPv6 NAT66 选项不再是必需项；它现在只用于 PID_NS/nftables/fw4
+---
+
+## 3. 当前实现（`04_start_openwrt_and_network.sh`）
+
+### 3.1 前缀检测
+
+```bash
+V6_CIDR=$(ip -6 addr show dev "$RMNET_IF" scope global | awk '/inet6/ {print $2; exit}')
+```
+
+只处理 `/64`：
+
+```text
+V6_NET      = <prefix>::/64
+V6_LAN_ADDR = <prefix>::1
+```
+
+> 5G 接口不是固定的：脚本用 `ip route get 8.8.8.8` 找真正承载默认路由的 `rmnet_dataX`，不写死 `rmnet_data0/1/2`。
+
+### 3.2 容器侧
+
+```text
+eth0:      <prefix>::1/64
+veth-owrt: fe80::2/64
+默认路由:  via fe80::1 dev veth-owrt
+```
+
+### 3.3 宿主侧
+
+```text
+veth-host: fe80::1/64
+
+table 200:
+  <prefix>::/64 dev veth-host
+
+ip -6 rule:
+  1000: iif <rmnet> lookup 200
+```
+
+作用：从 5G 进来的、目标地址属于 LAN `/64` 的包，转发到 `veth-host`，而不是又从 `rmnet` 发回去。
+
+如果 Wi-Fi 仍是默认路由、5G 不是默认，脚本还会尽力建立：
+
+```text
+table 201:
+  default via <5G IPv6 网关> dev <rmnet>
+
+ip -6 rule:
+  1001: from <prefix>::/64 lookup 201
+```
+
+> 某些 Android 版本的路由表不是以接口名命名，table 201 可能为空；已验证的主路径不依赖它，因为宿主 main 表已有 5G IPv6 默认路由。
+
+### 3.4 转发开关
+
+```bash
+echo 1 > /proc/sys/net/ipv6/conf/all/forwarding
+echo 1 > /proc/sys/net/ipv6/conf/<rmnet>/forwarding
+echo 1 > /proc/sys/net/ipv6/conf/veth-host/forwarding
+```
+
+Android netd 会在网络变化时重置这些值，自启看门狗每 30 秒重新断言。
+
+### 3.5 RA / DHCPv6
+
+`/etc/config/dhcp` 中 LAN：
+
+```text
+option ra 'server'
+option dhcpv6 'server'
+option ra_management '1'
+option ra_default '1'
+option ra_dns '1'
+```
+
+客户端通过 SLAAC 获得同 `/64` 地址，DNS 由 RA 下发。
+
+---
+
+## 4. 为什么不用 NAT66
+
+1. **不必要**：运营商已经给了 `/64`，LAN 可以直接用同前缀；
+2. **破坏端到端**：NAT66 会让外部无法主动连接 LAN 设备；
+3. **内核能力不是问题**：自定义内核虽然开了 `CONFIG_IP6_NF_NAT=y`，但当前方案完全没用到；
+4. **和 Android 热点行为一致**：热点就是原生共享，已经被运营商网络验证可行。
+
+---
+
+## 5. 已知限制
+
+1. **只处理 `/64`**：如果运营商给 `/56` / `/60`，脚本不会自动切前缀长度；
+2. **前缀变化不自动刷新**：5G 重拨后运营商可能换 `/64`，当前需要重跑 `04` 或重启手机；
+3. **没有 NDP proxy**：依赖运营商把整个 `/64` 路由到 UE；实测当前网络可用，但换运营商可能需要在 `rmnet` 上补 proxy NDP；
+4. **容器内没有 IPv6 防火墙**：`fw3` 未实际运行，IPv6 转发安全边界在宿主侧，默认没有做 LAN 隔离；
+5. **热点客户端不共享**：Android 热点仍是独立网络，与容器 LAN 隔离。
+
+---
+
+## 6. 验证命令
+
+```bash
+# 宿主
+adb shell su -c "ip -6 addr show dev rmnet_dataX scope global"
+adb shell su -c "ip -6 rule | head"
+adb shell su -c "ip -6 route show table 200"
+
+# 容器
+P=$(cat /data/openwrt/run/container.pid)
+BB=/data/adb/magisk/busybox
+$BB nsenter -t "$P" -m -u -n -p -- /system/bin/chroot /data/openwrt/rootfs /bin/sh -c '
+  export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+  ip -6 addr show eth0
+  ip -6 route
+  ping -6 -c 2 2400:3200::1
+'
+
+# 客户端
+# Windows: ipconfig /all，确认拿到同 /64 地址
+# 浏览器: https://test-ipv6.com/
+```

@@ -1,55 +1,227 @@
-# 一加9 Pro (SM8350) 运行 OpenWrt 5G 软路由：万全之策执行手册
+# 总计划与执行记录（As-Built）
 
-> **2026-10 更新（重要）**：优先执行 `README_BUILD.md` 的“零刷机方案”——**原厂内核 + `r8152` Magisk 模块 + OpenWrt 21.02**。原厂内核已具备 `NET_NS` / `VETH` / `BRIDGE` / `OVERLAY_FS` 与 IPv4 iptables，足以跑通 5G 软路由；2.5G 驱动通过 Magisk 模块加载。自定义内核（PID_NS/nftables/IPv6 NAT66 + 2.5G 内置）作为**实验性第二步**，下文阶段 2 的“必须编译内核”已不再是首选。
-
-本文档为你量身定制全套“防变砖、零风险、高可用”的落地闭环方案。手机到手后，按照本手册的阶段性检查清单（Checklist）操作，每一步都有验证指标和回滚逃生通道。
-
----
-
-## 一、 硬件与外设准备清单（手机到手前准备）
-
-要实现“7×24小时稳定 5G CPE + 2.5G 软路由”，外设选型至关重要：
-
-| 硬件设备 | 推荐型号 / 参数要求 | 避坑指南 |
-| :--- | :--- | :--- |
-| **Type-C 扩展坞** | 支持 **PD 100W/65W 供电输入** + 至少 1 个 **USB 3.0 (5Gbps)** 口 | 必须支持边供电边传输数据（PD Passthrough）；不要买劣质百兆小扩展坞，高通 DWC3 跑满 2.5G 需要 USB 3.0 带宽。 |
-| **USB 2.5G 网卡** | 芯片务必选用 **Realtek RTL8156B / RTL8156BG** | 兼容性最好，发热低。避免买到老旧的 RTL8156（初代无 B），初代发热大容易断流。ASIX AX88179A（千兆）亦可。 |
-| **充电头与数据线** | 30W~65W 标准 PD 协议充电头 + C-to-C 优质线缆 | 避免使用魔改私有快充协议（如非标准 65W/80W VOOC/WARP 直充头），建议使用通用 PD 协议让扩展坞握手 5V/9V 供电。 |
-| **散热措施（可选）** | 磁吸半导体散热背夹 或 弱电箱 5V 静音小风扇 | 虽已关停超大核并锁频，但夏季 7×24 小时密闭工作时，加微风散热可保基带射频寿命。 |
-| **SIM 卡与网络** | 5G 手机卡，开通 SA 模式与 VoLTE | 建议关闭移动数据漫游限制，确认 APN 设置。 |
+> 项目：一加 9 Pro（SM8350 / lemonadep / LE2120）→ Android + OpenWrt 5G CPE
+> 状态：**主链路已完成并验证**，剩余插网卡冷启动验收与可选项。
+> 最后更新：2026-11
 
 ---
 
-## 二、 全流程五大阶段路线图（按部就班）
+## 0. 目标与非目标
+
+### 目标
+
+1. 保留 Android 原生图形界面、相机、音频、内部 WiFi、指纹、5G 基带；
+2. 让手机同时成为一台 5G CPE：USB 网卡做 LAN，5G 做 WAN；
+3. OpenWrt 提供 DHCP / DNS / RA / LuCI / SSH / 防火墙 / 代理能力；
+4. 2.5G 驱动内置内核，不依赖 Magisk 模块；
+5. 电池长期保持在 50–60%，Cortex-X1 离线；
+6. 所有 OpenWrt 文件集中在 `/data/openwrt/`；
+7. 内核可云端构建，KABI 可验证，失败可回滚。
+
+### 非目标
+
+- 不把整机刷成 OpenWrt；
+- 不把 5G 基带直通给 OpenWrt；
+- 不把内部 WiFi 直通给 OpenWrt；
+- 不使用 WSL2 编译；
+- 不长期保留多个 Magisk 模块入口。
+
+---
+
+## 1. 最终架构
 
 ```text
-[手机到手]
-   │
-   ├─► 阶段 1：验机、固化底包、解锁 BL、获取 Root 权限并全量备份关键分区（安全底线）
-   │
-   ├─► 阶段 2：编译魔改 Linux 5.4 原厂内核（内置容器、Netfilter、全静态 2.5G 网卡驱动）
-   │
-   ├─► 阶段 3：部署纯用户空间 OpenWrt Rootfs（免编大源码，配置 fw3/iptables 与伪装驱动）
-   │
-   ├─► 阶段 4：直通 eth0 物理网卡与注入 veth 绕过安卓 netd 策略路由（打通内外网）
-   │          【优先在保留安卓完整图形界面下调试，通过屏幕实时监控 5G/基带/Termux】
-   │
-   └─► 阶段 5：验证 100% 成功后，按需开启无头化精简与电池停充（随时可通过脚本一键恢复图形界面）
+[Bootloader 解锁] → [AVB 关闭] → [Magisk 30.7] → [自定义 5.4.254 boot]
+                                                          │
+                                                   Android 正常启动
+                                                          │
+                                          Magisk service.d/00_openwrt.sh
+                                                          │
+                                      unshare -m -u -n -p -f + chroot
+                                                          │
+                                            OpenWrt 21.02.7 (/data/openwrt/rootfs)
+                                                          │
+                     ┌────────────────────────────────────┴────────────────────────────────────┐
+                     │                                                                         │
+          USB 2.5G/1G 网卡 (netns 直通)                                         veth-owrt 10.200.1.2/30
+             容器 eth0 192.168.2.1/24                                              veth-host 10.200.1.1/30
+                     │                                                                         │
+               PC / 交换机                                                      Android iptables MASQUERADE
+                                                                                           │
+                                                                                     rmnet_dataX (5G)
 ```
 
 ---
 
-## 三、 本目录已为你准备好的工具箱（即拿即用）
+## 2. 阶段执行记录
 
-所有中间产物与执行脚本均保存在本项目根目录或 `scripts/` 子目录下：
+| 阶段 | 内容 | 状态 | 证据 |
+| :---: | :--- | :---: | :--- |
+| 1 | 验机、确认型号/固件/分区 | ✅ | `LE2120_14.0.0.1901` |
+| 2 | Bootloader 解锁 | ✅ | `ro.boot.verifiedbootstate=orange` |
+| 3 | Magisk 30.7 Root | ✅ | Magisk App / `su` 可用 |
+| 4 | 关闭 AVB / dm-verity | ✅ | `vbmeta_a` flags `0x3`，见 `AVB_DISABLED.md` |
+| 5 | 117 分区全量备份 | ✅ | 14.29 GiB + SHA256，`full_backup_*` |
+| 6 | 合并恢复集 | ✅ | `backup_merged_*`，60 官方 + 57 phone-only |
+| 7 | 内核源码/工具链/工作流 | ✅ | `.github/workflows/build_kernel.yml` |
+| 8 | 自定义内核编译 | ✅ | run4 build `40346641157` |
+| 9 | KABI 1,607 符号校验 | ✅ | 100% 匹配 |
+| 10 | 刷入自定义 boot | ✅ | `new-boot-custom-v3.img` |
+| 11 | Android 功能回归 | ✅ | 显示/音频/相机/WiFi/指纹/5G |
+| 12 | 指纹修复 / 弹窗定位 | ✅ | `fps_hal=running`，一次性提示 |
+| 13 | 2.5G 内置驱动 | ✅ | `r8152 v2.22.1`，模块已移除 |
+| 14 | PID namespace 验证 | ✅ | 容器内 PID=1 |
+| 15 | OpenWrt rootfs 部署 | ✅ | 21.02.7 armvirt/64 |
+| 16 | 容器服务 | ✅ | procd/ubusd/uhttpd/dropbear/dnsmasq/odhcpd |
+| 17 | USB 网卡 netns 直通 | ✅ | 容器 `eth0 192.168.2.1/24` |
+| 18 | IPv4 NAT / 策略路由 | ✅ | PC DHCP、5G 出口 |
+| 19 | 原生 IPv6 `/64` | ✅ | PC 可 ping 容器与外网 |
+| 20 | LuCI 中文 | ✅ | `lang="zh-cn"`，标题“概览” |
+| 21 | 电源/充电守护 | ✅ | cpu7=0，60% 停充 |
+| 22 | 开机自启 / 看门狗 | ⚠️ | WAN-only 已验证；插网卡冷启动待验收 |
+| 23 | 目录统一 `/data/openwrt` | ✅ | 唯一入口 `service.d/00_openwrt.sh` |
+| 24 | 仓库审计 / 历史压缩 | ✅ | 无密钥/序列号，GPL-2.0 + NOTICE |
 
-1. **`MASTER_PLAN.md`**：本全局路线指南。
-2. **`RECOVERY_AND_ROLLBACK.md`**：救砖与紧急回滚手册（包含 9008 救砖与 Fastboot 恢复）。
-3. **`scripts/01_backup_partitions.sh`**：手机端一键备份 `boot`、`vendor_boot`、`dtbo`、`modem` 分区脚本。
-4. **`scripts/02_patch_kernel_config.py`**：一键将容器与软路由配置合入内核 `defconfig` 的脚本。
-5. **`scripts/03_setup_openwrt_rootfs.sh`**：在手机 `/data/openwrt` 自动解压并完成适配的脚本。
-6. **`scripts/04_start_openwrt_and_network.sh`**：自动启动容器、直通物理网卡、注入策略路由的主网关脚本（**完全不影响屏幕与 UI**）。
-7. **`scripts/05_headless_power_control.sh`**：熄屏、关渲染、离线 X1 超大核、限频、限充的温控脚本（生产服役模式）。
-8. **`scripts/06_restore_gui.sh`**：一键恢复安卓图形界面（点亮屏幕、启动合成器、恢复触控）。
-9. **`service_openwrt_autorun.sh`**：放在 `/data/openwrt/scripts/`，由唯一的 Magisk 入口 `/data/adb/service.d/00_openwrt.sh` 调用；负责开机自启、看门狗和 `ip_forward` 重断言。
-10. **`manifest_android14.xml` / `build.config.lemonadep` / `fix_op9p_build_errors.patch`**：官方内核源码构建配置与修复补丁。
+---
+
+## 3. 关键决策记录
+
+### D1：容器，而不是 VM / 整机固件
+
+- 5G 基带依赖 Android RIL/QMI 与厂商 modem 固件；
+- 保留 Android 才能继续用相机/显示/音频/WiFi/指纹；
+- 容器共享内核，开销低；
+- `PID_NS` 让 `procd` 安全当 PID 1。
+
+### D2：最小 KABI 变更，而不是“功能全开”
+
+- 99 个原厂 `.ko`、1,607 个符号 CRC 是硬约束；
+- 只开 `PID_NS`、`DEVTMPFS`、`MACVLAN`、`IP6_NF_NAT`、`r8152` 等；
+- 不开 `NF_TABLES` / `BRIDGE_NETFILTER` / `VLAN_8021Q` / `SYSVIPC` / `USER_NS`；
+- 显式 `RELR=n`；
+- 构建时 KABI 不匹配直接失败。
+
+### D3：OpenWrt 21.02，而不是 23.05 / 24.10
+
+- 内核 `NF_TABLES=n`；
+- 22.03+ 默认 `fw4` + nftables，起不来；
+- 21.02 是最后一个默认 `fw3` + iptables 的版本；
+- 23.05 可以禁用 `fw4` 跑用户态，但属于可选实验；
+- 24.10 改用 `apk`，脚本还要改。
+
+### D4：5G 不直通，宿主做 WAN
+
+- OpenWrt 没有 Android RIL/QMI 拨号栈；
+- 直通 `rmnet_dataX` 也不能拨号；
+- 正确模型：Android 负责数据连接，容器通过 veth + 宿主 NAT/策略路由出网。
+
+### D5：内部 WiFi 不直通
+
+- `qcacld-3.0` / `cnss2` 闭源厂商栈；
+- AP 模式依赖厂商 `hostapd`、BDF、`cnss-daemon`；
+- 移走 `wlan0/wlan2` 会打断 Android WiFi/热点，容器里也起不了 AP；
+- 若需要 OpenWrt WiFi，用 USB WiFi 网卡 + 内核内置 upstream 驱动。
+
+### D6：USB 网卡 netns 直通
+
+- 容器拿到真实 LAN 口；
+- 避免宿主在 LAN 侧再做一层 bridge/NAT；
+- 容器内统一改名 `eth0`，配置简单。
+
+### D7：单根目录 `/data/openwrt`
+
+```text
+/data/openwrt/{rootfs,scripts,packages,images,run,logs}
+```
+
+- 所有 OpenWrt 包、配置、脚本、镜像、状态、日志只放这里；
+- Magisk 只保留 `service.d/00_openwrt.sh` 一个入口；
+- 不再使用 `/data/adb/openwrt`、`/sdcard`、`/data/local/tmp` 存放运行文件。
+
+### D8：原生 IPv6，而不是 NAT66
+
+- 运营商 `/64` 同前缀共享；
+- 宿主转发 + table 200/201 策略路由；
+- 容器 `odhcpd` 发 RA；
+- 无 NAT66、无 ULA。
+
+---
+
+## 4. 硬件与外设
+
+| 设备 | 要求 | 当前状态 |
+| :--- | :--- | :--- |
+| 手机 | 一加 9 Pro LE2120，OOS 14 | ✅ |
+| USB-C 扩展坞 | PD 供电 + USB 3.0 | 用户自备 |
+| USB 2.5G 网卡 | RTL8156B / RTL8156BG | 已验证 |
+| 充电头 | 30–65W PD | 用户自备 |
+| 散热 | 可选 | 建议长期运行加 |
+
+> 避免使用非标准 VOOC/WARP 直充头；用通用 PD 让扩展坞握手。
+
+---
+
+## 5. 工具箱（实际文件）
+
+| 文件 | 用途 |
+| :--- | :--- |
+| `scripts/01_backup_partitions.sh` | 备份 boot/vendor_boot/dtbo/modem 等关键分区 |
+| `scripts/01b_full_backup_all_partitions.sh` | 117 分区全量备份 |
+| `scripts/02_patch_kernel_config.py` | 内核配置合入 |
+| `scripts/03_setup_openwrt_rootfs.sh` | 解压/适配 rootfs |
+| `scripts/04_start_openwrt_and_network.sh` | 启动容器、netns 直通、veth、NAT、IPv6 |
+| `scripts/05b_cpu_charge_guard.sh` | cpu7 离线、限频、50–60% 停充 |
+| `scripts/05_headless_power_control.sh` | 可选无头化节能 |
+| `scripts/06_android_functional_test.sh` | Android 功能/命名空间测试 |
+| `scripts/06_restore_gui.sh` | 恢复图形界面 |
+| `scripts/verify_kabi_crc.py` | 1,607 符号 CRC 闸门 |
+| `service_openwrt_autorun.sh` | 开机自启 + 看门狗 |
+| `service_power_guard.sh` | 电源守护拉起/防重复 |
+
+---
+
+## 6. 验收标准
+
+### 必须通过
+
+- [x] `uname -r` = `5.4.254-qgki-gd2a1055adeb0`
+- [x] KABI 1,607/1,607
+- [x] 99 个原厂模块全部加载
+- [x] 指纹 / 显示 / 音频 / 相机 / WiFi / 5G 正常
+- [x] `unshare -p -f` 内 PID=1
+- [x] 容器 `procd` / `dnsmasq` / `dropbear` / `odhcpd` 运行
+- [x] PC 通过 USB 网卡获得 `192.168.2.x`
+- [x] LuCI 中文可访问
+- [x] IPv4 出口正常
+- [x] IPv6 原生 `/64` 正常
+- [x] cpu7 离线，60% 停充
+
+### 待通过
+
+- [ ] 拔 USB 数据线、插 2.5G 网卡、重启手机，全自动恢复 LAN + WAN
+- [ ] 连续运行 24–72 小时无断流/内存泄漏
+- [ ] 5G 重拨后 IPv6 前缀自动刷新（当前需重跑 `04`）
+
+---
+
+## 7. 剩余工作
+
+| 优先级 | 事项 | 说明 |
+| :---: | :--- | :--- |
+| P0 | 插网卡冷启动验收 | 当前最大未验证项 |
+| P1 | 5G 重拨 / 网卡热插拔自动化 | 目前靠 30 秒看门狗与人工重跑 |
+| P2 | 23.05.5 + 禁用 fw4 旁路测试 | 不重编内核 |
+| P3 | AG / Clash 部署 | 仅服务 USB LAN |
+| P4 | USB WiFi 网卡 + 内置驱动 | 需要重编内核 |
+| P5 | Android OTA KABI 复验自动化 | 先对比 CRC 再决定是否重编 |
+
+---
+
+## 8. 相关文档
+
+- [`README.md`](README.md)：项目总览与架构
+- [`README_BUILD.md`](README_BUILD.md)：构建/刷机/部署/排错
+- [`TEST_REPORT.md`](TEST_REPORT.md)：测试与实验记录
+- [`IPV6_NOTES.md`](IPV6_NOTES.md)：IPv6 设计与实测
+- [`RECOVERY_AND_ROLLBACK.md`](RECOVERY_AND_ROLLBACK.md)：备份与回滚
+- [`AVB_DISABLED.md`](AVB_DISABLED.md)：AVB 关闭记录
