@@ -4,7 +4,7 @@
 > 系统：OOS 14 `LE2120_14.0.0.1901`
 > 内核：`5.4.254-qgki-gd2a1055adeb0`（自定义，GitHub Actions build `40346641157` / run4）
 > OpenWrt：21.02.7 `armvirt/64`
-> 最后一次上机：2026-10-27
+> 最后一次上机：2026-11-03
 > 结论：**主链路可用**；插网卡冷启动、23.05 用户态、AG/Clash 属于未完成/可选项。
 
 ---
@@ -32,6 +32,9 @@
 | IPv6 | 原生 `/64` / RA / 外网 | ✅ |
 | LuCI | 中文界面 | ✅ |
 | Autostart | WAN-only 自启 / 看门狗 | ✅ |
+| Clock | 容器不再改写 Android 时钟 | ✅ |
+| Clock | 重启后 NTP 自动校正 | ✅ |
+| Cleanup | 泄漏实例/进程树清理 | ✅ |
 | Autostart | 插 2.5G 网卡冷启动 | ⏳ 待验收 |
 
 ---
@@ -352,6 +355,54 @@ ip rule:
 
 - 拔掉 USB 数据线、插 2.5G 网卡、重启手机后，`eth0` 是否能稳定在容器启动前出现；
 - 若网卡枚举较晚，`04` 首次可能以 WAN-only 启动，需要看门狗或人工重跑才能把 `eth0` 移入容器。
+
+---
+
+### 8.1 时钟 / RTC 事故（2026-11-03）
+
+现象：手动同步好 Android 时间后，几十秒内又跳回 1970。
+
+根因链：
+
+1. 容器把宿主 `/dev` 绑进 rootfs；
+2. OpenWrt `sysfixtime` 开机执行 `hwclock -s -u -f /dev/rtc0`；
+3. 手机 RTC 停在 1970（`since_epoch` 约 77 万秒）；
+4. 容器因 veth/PID 清理 bug 每 30 秒失败重启，于是反复覆盖；
+5. 容器 `stop()` 又 `hwclock -w` 把错误时间写回 RTC，形成闭环；
+6. Android `AUTO_TIME=0`，且 NTP 默认 18 小时才刷新一次。
+
+修复：
+
+- `03` 删除 `sysfixtime` / `sysntpd` rc 链接，替换 `sysfixtime` 为 no-op，注释 `hwclock --systz`，关闭容器 NTP；
+- `04` 在 init 完成后把 `/dev/rtc0` / `/dev/rtc` 覆盖为 `/dev/null`；
+- `04` 清理整个容器进程树、加锁、修正 veth 创建、等 PID namespace init；
+- autorun 用 `ip -4 route show table all` 找 5G，等待 180 秒；
+- Android `auto_time=1`，`ntp_server=ntp.aliyun.com`，NTP force refresh。
+
+清理结果：
+
+| 指标 | 清理前 | 清理后 |
+| :--- | ---: | ---: |
+| rootfs 进程 | 2002 | 10（1 个容器） |
+| 独立 netns | 196 | 1 |
+| `procd` | 194 | 1 |
+| `ntpd` | 193 | 0 |
+
+验证：
+
+- 容器启动/重启前后宿主时间不变；
+- 容器 `date +%s` 与宿主 epoch 一致；
+- 重启 Android 后时间保持正确；
+- 看门狗杀容器后 30 秒内自动重启，`04 exit=0`；
+- 容器内 `/dev/rtc0` 显示为 `/dev/null`（major 1,3）。
+
+RTC 写入：
+
+```text
+hwclock: ioctl RTC_SET_TIME: Permission denied
+```
+
+即使 `setenforce 0` 也一样，说明是内核/固件限制；RTC 仍为 1970。Android 依赖 NTP 校正，容器不再接触 RTC。详见 [`TIME_NOTES.md`](TIME_NOTES.md)。
 
 ---
 

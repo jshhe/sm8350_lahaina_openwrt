@@ -68,10 +68,30 @@ adb shell su -c "tail -50 /data/openwrt/logs/init.log"
 adb shell su -c "tail -20 /data/openwrt/logs/power_guard.log"
 ```
 
-### 2.3 重新部署 rootfs
+### 2.3 时间被改回 1970
+
+如果只是时间问题，不要刷机：
+
+```bash
+adb shell su -c "rm -f /data/openwrt/rootfs/etc/rc.d/*sysfixtime"
+adb shell su -c "rm -f /data/openwrt/rootfs/etc/rc.d/*sysntpd"
+adb shell su -c "sed -i 's|hwclock -u --systz|# hwclock -u --systz|' /data/openwrt/rootfs/etc/init.d/system"
+adb shell su -c "sh /data/openwrt/scripts/04_start_openwrt_and_network.sh"
+```
+
+Android 侧：
+
+```bash
+adb shell su -c "settings put global auto_time 1"
+adb shell su -c "settings put global ntp_server ntp.aliyun.com"
+adb shell cmd network_time_update_service force_refresh
+```
+
+完整修复与验证见 [`TIME_NOTES.md`](TIME_NOTES.md)。
+
+### 2.4 重新部署 rootfs
 
 > `03` 会 **清空** `/data/openwrt/rootfs`。先备份配置：
-
 ```bash
 adb shell su -c "cp -a /data/openwrt/rootfs/etc/config /data/openwrt/config_backup"
 adb shell su -c "cp -a /data/openwrt/rootfs/etc /data/openwrt/etc_backup"

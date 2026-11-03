@@ -1,4 +1,8 @@
 #!/system/bin/sh
+# Android's toybox ip is required for named veth pairs and netns operations.
+# Magisk's PATH can put BusyBox ip first, which silently fails to create the
+# peer; keep toybox first and call BusyBox only via $BB.
+export PATH=/system/bin:/system/xbin:$PATH
 # ==============================================================================
 # 04_start_openwrt_and_network.sh
 # Start the OpenWrt chroot, move the USB LAN NIC into its netns, create a veth
@@ -25,11 +29,134 @@ OWRT_IP="10.200.1.2"
 HOST_NET="10.200.1.0/30"
 TABLE_ID=100
 CONTAINER_PID=""
+CONTAINER_STARTED=0
+LOCK_DIR="$RUN_DIR/04.lock.d"
+LOCK_HELD=0
 
 log() { echo "[$(date +%H:%M:%S)] $*"; }
 
+# Find the active 5G interface.  The system default route may be Wi-Fi, so check
+# each rmnet interface for an IPv4 address and its own default table.
+find_rmnet_wan() {
+    # Find the first IPv4 default route whose device is an rmnet interface.
+    # This is more reliable than probing per-interface tables, which can be
+    # temporarily empty while Android reconnects the PDN.
+    dev=$(ip -4 route show table all 2>/dev/null | awk '/^default/ {
+        d="";
+        for (i=1;i<=NF;i++) if ($i=="dev") { d=$(i+1); break }
+        if (d ~ /^rmnet/) { print d; exit }
+    }')
+    if [ -n "$dev" ]; then
+        echo "$dev"
+        return 0
+    fi
+    for iface in rmnet_data0 rmnet_data1 rmnet_data2 rmnet_data3 rmnet_data4 rmnet_data5 rmnet0 v4-rmnet_data0; do
+        ip -4 addr show "$iface" 2>/dev/null | grep -q 'inet ' || continue
+        ip route show table "$iface" 2>/dev/null | grep -q '^default' || continue
+        echo "$iface"
+        return 0
+    done
+    return 1
+}
+
+# ------------------------------------------------------------------------------
+# Kill every process that belongs to the OpenWrt container.  PID files are not
+# enough: a failed startup leaves the PID-namespace init and its children alive,
+# and killing only the unshare wrapper does not tear the namespace down.
+#
+# Killing the namespace init (procd) makes the kernel terminate every other
+# process in that PID namespace, so we only inspect procd + wrapper PIDs instead
+# of spawning readlink/cat for every process on the phone (that took minutes).
+# ------------------------------------------------------------------------------
+kill_container_tree() {
+    sig="$1"
+    list=""
+
+    for pid in $(ps -A -o PID,NAME 2>/dev/null | awk '$2=="procd" {print $1}'); do
+        [ "$pid" = "$$" ] && continue
+        root=$(readlink "/proc/$pid/root" 2>/dev/null) || continue
+        case "$root" in
+            "$ROOTFS"|"$ROOTFS"/*) list="$list $pid" ;;
+        esac
+    done
+
+    # The unshare/chroot wrappers keep the host root, so match their cmdline.
+    for pid in $(ps -A -o PID,ARGS 2>/dev/null | grep -E "unshare.*$ROOTFS|chroot.*$ROOTFS" | grep -v grep | awk '{print $1}'); do
+        [ "$pid" = "$$" ] && continue
+        list="$list $pid"
+    done
+
+    if [ -n "$list" ]; then
+        log "killing container processes (-$sig): $(echo $list | wc -w)"
+        kill "-$sig" $list 2>/dev/null
+    fi
+}
+
+# Slow fallback for an abnormal state where the namespace init is already gone
+# but some chrooted process survived.  Only used when the fast path leaves
+# processes behind.
+kill_container_rootfs_fallback() {
+    sig="$1"
+    list=""
+    for p in /proc/[0-9]*; do
+        pid=${p#/proc/}
+        [ "$pid" = "$$" ] && continue
+        root=$(readlink "$p/root" 2>/dev/null) || continue
+        case "$root" in
+            "$ROOTFS"|"$ROOTFS"/*) list="$list $pid" ;;
+        esac
+    done
+    if [ -n "$list" ]; then
+        log "fallback killing rootfs processes (-$sig): $(echo $list | wc -w)"
+        kill "-$sig" $list 2>/dev/null
+    fi
+}
+
+cleanup_old_container() {
+    if [ -f "$RUN_DIR/container.pid" ]; then
+        log "Stopping previous container (pid file: $(cat "$RUN_DIR/container.pid" 2>/dev/null))"
+    fi
+    kill_container_tree TERM
+    sleep 2
+    kill_container_tree KILL
+    sleep 1
+    rm -f "$RUN_DIR/container.pid"
+    # Remove stale veth pairs from earlier failed attempts.  The toybox/busybox
+    # split is important: toybox creates a correct pair only with "name ...".
+    for v in "$VETH_HOST" veth0 veth1; do
+        ip link show "$v" >/dev/null 2>&1 && ip link del "$v" 2>/dev/null
+    done
+}
+
+cleanup_on_exit() {
+    status=$?
+    if [ "$status" -ne 0 ] && [ "$CONTAINER_STARTED" = "1" ]; then
+        log "ERROR: container startup failed; cleaning up leaked processes"
+        kill_container_tree TERM
+        sleep 2
+        kill_container_tree KILL
+        rm -f "$RUN_DIR/container.pid"
+    fi
+    [ "$LOCK_HELD" = "1" ] && rm -rf "$LOCK_DIR"
+}
+trap cleanup_on_exit EXIT
+
 [ -d "$ROOTFS" ] || { log "ERROR: $ROOTFS not found; run 03_setup_openwrt_rootfs.sh first"; exit 1; }
 mkdir -p "$STATE_DIR" "$RUN_DIR" "$LOG_DIR"
+
+# Serialize 04: autorun, a manual run, or a stale watchdog must never create
+# veth pairs/containers at the same time.
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    old=$(cat "$LOCK_DIR/pid" 2>/dev/null)
+    if [ -n "$old" ] && [ -d "/proc/$old" ] && [ "$old" != "$$" ]; then
+        log "another 04 instance is running (pid $old); exiting"
+        exit 0
+    fi
+    rm -rf "$LOCK_DIR"
+    mkdir "$LOCK_DIR" 2>/dev/null || { log "ERROR: cannot acquire 04 lock"; exit 1; }
+fi
+echo $$ > "$LOCK_DIR/pid"
+LOCK_HELD=1
 
 # ------------------------------------------------------------------------------
 # Locate BusyBox. Android's toybox ip does not implement 'ip link ... netns';
@@ -46,6 +173,10 @@ done
 BB_IP="$BB ip"
 log "busybox: $BB"
 
+# Kill any previous/leaked container before doing anything else.  The old netns
+# may still own eth0, and stale veth pairs break the next startup.
+cleanup_old_container
+
 # ------------------------------------------------------------------------------
 # Find the 5G WAN interface. Prefer the clat IPv4 interface when Android has
 # created one (IPv6-only carrier + 464XLAT).
@@ -57,15 +188,17 @@ RMNET_IF=$(ip route get 8.8.8.8 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i==
 case "$RMNET_IF" in
     rmnet*|v4-rmnet*) ;;
     *)
-        RMNET_IF=""
-        for iface in rmnet_data1 rmnet_data0 rmnet0 v4-rmnet_data0; do
-            if ip link show "$iface" >/dev/null 2>&1 && ip -4 addr show "$iface" 2>/dev/null | grep -q "inet "; then
-                RMNET_IF="$iface"
-                break
-            fi
-        done
+        RMNET_IF=$(find_rmnet_wan)
         ;;
 esac
+# The PDN can flap while Android reconnects; give it a short grace period.
+if [ -z "$RMNET_IF" ]; then
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+        RMNET_IF=$(find_rmnet_wan)
+        [ -n "$RMNET_IF" ] && break
+        sleep 2
+    done
+fi
 [ -n "$RMNET_IF" ] || { log "ERROR: no active rmnet interface; enable mobile data and disable Wi-Fi"; exit 1; }
 log "5G WAN (IPv4): $RMNET_IF"
 
@@ -110,31 +243,6 @@ else
 fi
 
 # ------------------------------------------------------------------------------
-# Stop a previous container if present.
-# ------------------------------------------------------------------------------
-if [ -f "$RUN_DIR/container.pid" ]; then
-    OLD_PID=$(cat "$RUN_DIR/container.pid")
-    if [ -d "/proc/$OLD_PID" ]; then
-        log "Stopping previous container PID $OLD_PID"
-        kill -TERM "$OLD_PID" 2>/dev/null
-        sleep 2
-        kill -KILL "$OLD_PID" 2>/dev/null
-    fi
-    rm -f "$RUN_DIR/container.pid"
-fi
-
-# The old container owned eth0; once it is gone the NIC is back in the host
-# netns, so re-detect the LAN interface before moving it.
-if ! ip link show "$LAN_IF" >/dev/null 2>&1; then
-    for iface in eth0 usb0 eth1; do
-        if ip link show "$iface" >/dev/null 2>&1; then
-            LAN_IF="$iface"
-            break
-        fi
-    done
-fi
-
-# ------------------------------------------------------------------------------
 # Namespace flags. Mount/UTS/net exist on the stock kernel; PID/IPC appear only
 # after the custom kernel is flashed.
 # ------------------------------------------------------------------------------
@@ -172,9 +280,28 @@ $UNSHARE $NS_FLAGS /system/bin/sh -c '
     exec /system/bin/chroot "$ROOTFS" /sbin/init
 ' sh "$ROOTFS" </dev/null >$LOG_DIR/init.log 2>&1 &
 UNSHARE_PID=$!
-sleep 3
-CONTAINER_PID=$(ps -A -o PID,PPID 2>/dev/null | awk -v p="$UNSHARE_PID" '$2==p {print $1; exit}')
-[ -n "$CONTAINER_PID" ] || CONTAINER_PID="$UNSHARE_PID"
+
+# Wait for the PID-namespace init instead of racing a fixed sleep.  Using the
+# wrapper PID as container PID leaves the real init alive when startup fails.
+CONTAINER_PID=""
+i=0
+while [ $i -lt 20 ]; do
+    CONTAINER_PID=$(ps -A -o PID,PPID 2>/dev/null | awk -v p="$UNSHARE_PID" '$2==p {print $1; exit}')
+    [ -n "$CONTAINER_PID" ] && break
+    sleep 1
+    i=$((i+1))
+done
+if [ -z "$CONTAINER_PID" ]; then
+    for p in /proc/[0-9]*; do
+        pid=${p#/proc/}
+        root=$(readlink "$p/root" 2>/dev/null) || continue
+        case "$root" in
+            "$ROOTFS"|"$ROOTFS"/*) CONTAINER_PID="$pid"; break ;;
+        esac
+    done
+fi
+[ -n "$CONTAINER_PID" ] || { log "ERROR: container init not found; check $LOG_DIR/init.log"; exit 1; }
+CONTAINER_STARTED=1
 echo "$CONTAINER_PID" > "$RUN_DIR/container.pid"
 log "unshare wrapper PID: $UNSHARE_PID, container init PID: $CONTAINER_PID"
 [ -d "/proc/$CONTAINER_PID" ] || { log "ERROR: container exited; check $LOG_DIR/init.log"; exit 1; }
@@ -190,18 +317,24 @@ if ip link show "$LAN_IF" >/dev/null 2>&1; then
     fi
     log "moved $LAN_IF -> container"
 else
-    log "WARN: $LAN_IF disappeared before move"
+    log "WARN: $LAN_IF not present; starting WAN-only"
 fi
 
 # ------------------------------------------------------------------------------
 # Create the veth WAN pair.
+# Android toybox requires the explicit "name <if>" form for a named veth pair.
+# BusyBox's ip returns success but does not create the peer on this build, so
+# use toybox for creation and BusyBox only for the netns move.
 # ------------------------------------------------------------------------------
 ip link del "$VETH_HOST" 2>/dev/null
-if ! ip link add "$VETH_HOST" type veth peer name "$VETH_OWRT" 2>/dev/null; then
-    if ! $BB_IP link add "$VETH_HOST" type veth peer name "$VETH_OWRT"; then
-        log "ERROR: failed to create veth pair"
-        exit 1
-    fi
+if ! ip link add name "$VETH_HOST" type veth peer name "$VETH_OWRT" 2>/dev/null; then
+    log "ERROR: failed to create veth pair"
+    exit 1
+fi
+if ! ip link show "$VETH_OWRT" >/dev/null 2>&1; then
+    log "ERROR: veth peer $VETH_OWRT was not created"
+    ip link del "$VETH_HOST" 2>/dev/null
+    exit 1
 fi
 if ! $BB_IP link set "$VETH_OWRT" netns "$CONTAINER_PID"; then
     log "ERROR: failed to move $VETH_OWRT into container netns"
@@ -267,14 +400,28 @@ if [ -n "$V6_NET" ]; then
     echo 1 > "/proc/sys/net/ipv6/conf/$RMNET_IF/forwarding" 2>/dev/null
     echo 1 > "/proc/sys/net/ipv6/conf/$VETH_HOST/forwarding" 2>/dev/null
     ip -6 addr add fe80::1/64 dev "$VETH_HOST" 2>/dev/null
-    # The container's default route needs the host-side fe80::1 to exist first.
-    $NSENTER -t "$CONTAINER_PID" -n -- ip -6 route replace default via fe80::1 dev "$VETH_OWRT"
-    # netifd has settled by now, so these addresses are no longer flushed.
-    $NSENTER -t "$CONTAINER_PID" -n -- ip -6 addr add "$V6_LAN_ADDR/64" dev eth0 2>/dev/null
+    # Give the container side its link-local address before installing the
+    # default route, otherwise the route can fail with "Network is unreachable".
     $NSENTER -t "$CONTAINER_PID" -n -- ip -6 addr add fe80::2/64 dev "$VETH_OWRT" 2>/dev/null
-    $NSENTER -t "$CONTAINER_PID" -n -- ip -6 route replace "$V6_NET" dev eth0
-    log "IPv6 LAN: $V6_LAN_ADDR/64 on eth0"
-    ip -6 route replace "$V6_NET" dev "$VETH_HOST" table 200
+    V6_DEFAULT_OK=0
+    for i in 1 2 3 4 5; do
+        if $NSENTER -t "$CONTAINER_PID" -n -- ip -6 route replace default via fe80::1 dev "$VETH_OWRT" onlink 2>/dev/null; then
+            V6_DEFAULT_OK=1
+            break
+        fi
+        sleep 1
+    done
+    [ "$V6_DEFAULT_OK" = "1" ] || log "WARN: could not set container IPv6 default route"
+    # netifd has settled by now, so these addresses are no longer flushed.
+    if $NSENTER -t "$CONTAINER_PID" -n -- ip link show eth0 >/dev/null 2>&1; then
+        $NSENTER -t "$CONTAINER_PID" -n -- ip -6 addr add "$V6_LAN_ADDR/64" dev eth0 2>/dev/null
+        $NSENTER -t "$CONTAINER_PID" -n -- ip -6 route replace "$V6_NET" dev eth0 2>/dev/null
+        log "IPv6 LAN: $V6_LAN_ADDR/64 on eth0"
+    else
+        log "WARN: LAN NIC not in container; IPv6 LAN address skipped"
+    fi
+    ip -6 route replace "$V6_NET" dev "$VETH_HOST" table 200 2>/dev/null \
+        || log "WARN: could not add IPv6 route table 200"
     ip -6 rule del iif "$RMNET_IF" lookup 200 2>/dev/null
     ip -6 rule add iif "$RMNET_IF" lookup 200 pref 1000
 
@@ -282,7 +429,7 @@ if [ -n "$V6_NET" ]; then
     # default route (we use Wi-Fi for adb while testing).
     V6_GW=$(ip -6 route show default table "$RMNET_IF" 2>/dev/null | awk '/default/ {for (i=1;i<=NF;i++) if ($i=="via") {print $(i+1); exit}}')
     if [ -n "$V6_GW" ]; then
-        ip -6 route replace default via "$V6_GW" dev "$RMNET_IF" table 201
+        ip -6 route replace default via "$V6_GW" dev "$RMNET_IF" table 201 2>/dev/null
         ip -6 rule del from "$V6_NET" lookup 201 2>/dev/null
         ip -6 rule add from "$V6_NET" lookup 201 pref 1001
     fi
@@ -291,13 +438,16 @@ if [ -n "$V6_NET" ]; then
 fi
 
 # ------------------------------------------------------------------------------
-# Build a dedicated IPv4 table for the 5G WAN. Android's per-network tables are
-# numeric and not guaranteed to be named after the interface, so never use
-# 'lookup $RMNET_IF' (that is an interface name, not a routing table name).
+# Build a dedicated IPv4 table for the 5G WAN.  Android's per-network tables
+# are normally named after the interface on this build, but we still fall back
+# to route lookup / default-device probing.
 # ------------------------------------------------------------------------------
-RMNET_GW=$(ip route get 8.8.8.8 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="via") {print $(i+1); exit}}')
+RMNET_GW=$(ip route get 8.8.8.8 oif "$RMNET_IF" 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="via") {print $(i+1); exit}}')
 if [ -z "$RMNET_GW" ]; then
     RMNET_GW=$(ip route show table "$RMNET_IF" 2>/dev/null | awk '/^default/ {for (i=1;i<=NF;i++) if ($i=="via") {print $(i+1); exit}}')
+fi
+if [ -z "$RMNET_GW" ]; then
+    RMNET_GW=$(ip route show default dev "$RMNET_IF" 2>/dev/null | awk '/^default/ {for (i=1;i<=NF;i++) if ($i=="via") {print $(i+1); exit}}')
 fi
 if [ -n "$RMNET_GW" ]; then
     ip route replace default via "$RMNET_GW" dev "$RMNET_IF" table "$TABLE_ID"
@@ -349,6 +499,32 @@ $IPT -I FORWARD -i "$RMNET_IF" -o "$VETH_HOST" -m state --state RELATED,ESTABLIS
 # The phone is a single UE; if the carrier gives a /64, the correct approach is
 # NDP proxy / prefix sharing so LAN clients get native addresses.
 # See IPV6_NOTES.md.
+
+# Final IPv6 re-assert.  netifd/odhcpd can flush routes and LAN addresses after
+# the asynchronous reload above, so put them back once more at the very end.
+if [ -n "$V6_NET" ]; then
+    ip -6 addr add fe80::1/64 dev "$VETH_HOST" 2>/dev/null
+    $NSENTER -t "$CONTAINER_PID" -n -- ip -6 addr add fe80::2/64 dev "$VETH_OWRT" 2>/dev/null
+    V6_DEFAULT_OK=0
+    for i in 1 2 3 4 5; do
+        if $NSENTER -t "$CONTAINER_PID" -n -- ip -6 route replace default via fe80::1 dev "$VETH_OWRT" onlink 2>/dev/null; then
+            V6_DEFAULT_OK=1
+            break
+        fi
+        sleep 1
+    done
+    [ "$V6_DEFAULT_OK" = "1" ] || log "WARN: IPv6 default route still missing"
+    if $NSENTER -t "$CONTAINER_PID" -n -- ip link show eth0 >/dev/null 2>&1; then
+        $NSENTER -t "$CONTAINER_PID" -n -- ip -6 addr add "$V6_LAN_ADDR/64" dev eth0 2>/dev/null
+        $NSENTER -t "$CONTAINER_PID" -n -- ip -6 route replace "$V6_NET" dev eth0 2>/dev/null
+    fi
+    ip -6 route replace "$V6_NET" dev "$VETH_HOST" table 200 2>/dev/null
+    owrt_exec "/etc/init.d/odhcpd restart" 2>/dev/null
+fi
+
+# Final RTC mask: OpenWrt's preinit (and network reload) can mount devtmpfs over
+# /dev, so do this only after all init/reload work is finished.
+owrt_exec "mount --bind /dev/null /dev/rtc0 2>/dev/null; mount --bind /dev/null /dev/rtc 2>/dev/null"
 
 log "OpenWrt started."
 log "  LAN: http://192.168.2.1"

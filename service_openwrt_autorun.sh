@@ -14,7 +14,9 @@
 # Disable without removing:
 #   touch /data/openwrt/disable_autorun
 # ==============================================================================
-export PATH=/data/adb/magisk:/system/bin:/system/xbin:$PATH
+# Keep toybox first: BusyBox ip cannot create a named veth peer on this build.
+# BusyBox applets are called explicitly through $BB instead.
+export PATH=/system/bin:/system/xbin:$PATH
 
 BB=/data/adb/magisk/busybox
 LOG=/data/openwrt/logs/autorun.log
@@ -35,6 +37,27 @@ container_running() {
     return 1
 }
 
+# Find the active 5G interface.  Do not use the system default route: Wi-Fi may
+# be the default while 5G still has its own per-network default table.
+find_rmnet_wan() {
+    dev=$(ip -4 route show table all 2>/dev/null | $BB awk '/^default/ {
+        d="";
+        for (i=1;i<=NF;i++) if ($i=="dev") { d=$(i+1); break }
+        if (d ~ /^rmnet/) { print d; exit }
+    }')
+    if [ -n "$dev" ]; then
+        echo "$dev"
+        return 0
+    fi
+    for iface in rmnet_data0 rmnet_data1 rmnet_data2 rmnet_data3 rmnet_data4 rmnet_data5; do
+        ip -4 addr show "$iface" 2>/dev/null | grep -q 'inet ' || continue
+        ip route show table "$iface" 2>/dev/null | grep -q '^default' || continue
+        echo "$iface"
+        return 0
+    done
+    return 1
+}
+
 # Android's netd resets ip_forward and the policy rules when the network
 # changes (hotspot off, USB NIC plug, 5G reconnect).  Re-assert them.
 ensure_wan() {
@@ -43,10 +66,25 @@ ensure_wan() {
 
     ip route show table 100 2>/dev/null | grep -q '10.200.1.0/30' || ip route replace 10.200.1.0/30 dev veth-host table 100
 
-    W=$(ip route get 8.8.8.8 2>/dev/null | $BB awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')
-    G=$(ip route get 8.8.8.8 2>/dev/null | $BB awk '{for (i=1;i<=NF;i++) if ($i=="via") {print $(i+1); exit}}')
+    W=$(ip route show table 100 2>/dev/null | $BB awk '/^default/ {for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')
+    case "$W" in
+        rmnet*|v4-rmnet*) ;;
+        *)
+            # Wi-Fi may be the default route. Find a 5G interface that has its
+            # own default route instead of accidentally using the Wi-Fi gateway.
+            W=""
+            for iface in rmnet_data0 rmnet_data1 rmnet_data2 rmnet_data3 rmnet_data4 rmnet_data5; do
+                if ip route show table "$iface" 2>/dev/null | grep -q '^default'; then
+                    W="$iface"
+                    break
+                fi
+            done
+            ;;
+    esac
     case "$W" in
         rmnet*|v4-rmnet*)
+            G=$(ip route get 8.8.8.8 oif "$W" 2>/dev/null | $BB awk '{for (i=1;i<=NF;i++) if ($i=="via") {print $(i+1); exit}}')
+            [ -n "$G" ] || G=$(ip route show table "$W" 2>/dev/null | $BB awk '/^default/ {for (i=1;i<=NF;i++) if ($i=="via") {print $(i+1); exit}}')
             if [ -n "$G" ]; then
                 ip route replace default via "$G" dev "$W" table 100
             else
@@ -76,14 +114,13 @@ while [ "$(getprop sys.boot_completed)" != "1" ] && [ $i -lt 90 ]; do
     i=$((i+1))
 done
 
-# Wait for the 5G IPv4 default route (mobile data up).
+# Wait for 5G data.  After a cold boot the modem/PDN can take over two minutes,
+# and Wi-Fi may already be the system default route, so poll rmnet explicitly.
 i=0
 IF=""
-while [ $i -lt 60 ]; do
-    IF=$(ip route get 8.8.8.8 2>/dev/null | $BB awk '{for (j=1;j<=NF;j++) if ($j=="dev") {print $(j+1); exit}}')
-    case "$IF" in
-        rmnet*|v4-rmnet*) break ;;
-    esac
+while [ $i -lt 90 ]; do
+    IF=$(find_rmnet_wan)
+    [ -n "$IF" ] && break
     sleep 2
     i=$((i+1))
 done

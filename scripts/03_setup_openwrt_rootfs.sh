@@ -104,6 +104,41 @@ mkdir -p "$DEST_DIR/lib/modules/$KVER"
 : > "$DEST_DIR/lib/modules/$KVER/modules.builtin"
 : > "$DEST_DIR/lib/modules/$KVER/modules.alias"
 
+# ------------------------------------------------------------------------------
+# The container shares the Android kernel and /dev.  OpenWrt's sysfixtime reads
+# /dev/rtc0 at boot and writes it back at shutdown.  On this phone the RTC can
+# be stale (1970), so doing that would overwrite the Android system clock and
+# fight Android's time_daemon.  Android owns the clock: disable all container
+# RTC/NTP time handling.
+# ------------------------------------------------------------------------------
+rm -f "$DEST_DIR"/etc/rc.d/*sysfixtime "$DEST_DIR"/etc/rc.d/*sysntpd
+
+cat > "$DEST_DIR/etc/init.d/sysfixtime" <<'EOF'
+#!/bin/sh /etc/rc.common
+# Disabled: the container shares the Android host clock and must never read or
+# write /dev/rtc0.  Android's time_daemon/NTP owns the clock.
+START=00
+STOP=90
+start() { return 0; }
+stop() { return 0; }
+boot() { return 0; }
+EOF
+chmod 755 "$DEST_DIR/etc/init.d/sysfixtime"
+
+if [ -f "$DEST_DIR/etc/init.d/system" ]; then
+    sed -i 's|hwclock -u --systz|# hwclock -u --systz (disabled: Android owns the clock)|' \
+        "$DEST_DIR/etc/init.d/system"
+    if grep -q '^[[:space:]]*hwclock -u --systz' "$DEST_DIR/etc/init.d/system"; then
+        echo "[!] failed to disable hwclock --systz in /etc/init.d/system"
+        exit 1
+    fi
+fi
+
+if [ -f "$DEST_DIR/etc/config/system" ]; then
+    sed -i "/config timeserver 'ntp'/,/^$/ s/option enabled '1'/option enabled '0'/" \
+        "$DEST_DIR/etc/config/system"
+fi
+
 mkdir -p "$DEST_DIR/dev" "$DEST_DIR/dev/pts" "$DEST_DIR/proc" "$DEST_DIR/sys" "$DEST_DIR/tmp"
 
 echo "[4/5] Writing network/firewall/dhcp config ..."

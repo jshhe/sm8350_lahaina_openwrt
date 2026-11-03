@@ -81,6 +81,8 @@
 | 22 | 开机自启 / 看门狗 | ⚠️ | WAN-only 已验证；插网卡冷启动待验收 |
 | 23 | 目录统一 `/data/openwrt` | ✅ | 唯一入口 `service.d/00_openwrt.sh` |
 | 24 | 仓库审计 / 历史压缩 | ✅ | 无密钥/序列号，GPL-2.0 + NOTICE |
+| 25 | 容器时钟/RTC 隔离 | ✅ | 禁用 sysfixtime/sysntpd，RTC 覆盖为 null |
+| 26 | 容器泄漏清理 / 04 加锁 | ✅ | 2002 进程/196 netns → 1 容器 |
 
 ---
 
@@ -144,6 +146,14 @@
 - 宿主转发 + table 200/201 策略路由；
 - 容器 `odhcpd` 发 RA；
 - 无 NAT66、无 ULA。
+
+### D9：时钟只允许 Android 管理
+
+- 容器与 Android 共享内核和 `/dev`；
+- OpenWrt 的 `sysfixtime` / `sysntpd` 会读写宿主 RTC，而本机 RTC 停在 1970；
+- 因此容器内禁用所有 RTC/NTP 时间处理，并在 init 后把 `/dev/rtc0` 覆盖为 `/dev/null`；
+- Android `auto_time=1` + `ntp_server=ntp.aliyun.com` 负责校时；
+- 详见 [`TIME_NOTES.md`](TIME_NOTES.md)。
 
 ---
 
@@ -223,5 +233,6 @@
 - [`README_BUILD.md`](README_BUILD.md)：构建/刷机/部署/排错
 - [`TEST_REPORT.md`](TEST_REPORT.md)：测试与实验记录
 - [`IPV6_NOTES.md`](IPV6_NOTES.md)：IPv6 设计与实测
+- [`TIME_NOTES.md`](TIME_NOTES.md)：容器时钟/RTC 事故与修复
 - [`RECOVERY_AND_ROLLBACK.md`](RECOVERY_AND_ROLLBACK.md)：备份与回滚
 - [`AVB_DISABLED.md`](AVB_DISABLED.md)：AVB 关闭记录

@@ -10,7 +10,7 @@
 - **IPv6**：运营商 `/64` 原生共享，**不做 NAT66**。
 
 > **项目状态：可用，持续验证中。**
-> 最后一次上机验证：2026-10-27。Android 关键功能、内核、容器、IPv4/IPv6、LuCI 中文均已通过。
+> 最后一次上机验证：2026-11-03。Android 关键功能、内核、容器、IPv4/IPv6、LuCI 中文、时间/RTC 隔离均已通过。
 > 尚未完成：拔掉 USB 数据线、插上 2.5G 网卡后的完整冷启动验收。
 
 ---
@@ -84,6 +84,7 @@ Android 宿主 + namespace/chroot 容器 + USB 网卡 netns 直通 + 5G 宿主 N
 | IPv4 NAT | ✅ | LAN → veth → 宿主 MASQUERADE → 5G |
 | 原生 IPv6 | ✅ | PC 获得运营商 `/64` 地址，可 ping 容器 `::1` 与外网 |
 | 电源守护 | ✅ | `cpu7=0`、A55 1.32GHz、A78 1.44GHz、60% 停充 / 50% 恢复 |
+| 宿主时间 | ✅ | 容器不再读写 RTC；重启后由 Android NTP 校正 |
 | 开机自启 | ⚠️ | WAN-only 路径已验证；插网卡冷启动待验收 |
 
 详细的测试过程、缺陷与修复记录见 **[`TEST_REPORT.md`](TEST_REPORT.md)**。
@@ -201,6 +202,7 @@ Magisk 只保留一个入口：
 | [`README_BUILD.md`](README_BUILD.md) | 内核构建、KABI 配置、刷机、OpenWrt 部署、验证与排错 |
 | [`TEST_REPORT.md`](TEST_REPORT.md) | 已完成的测试、实验、缺陷与修复记录 |
 | [`IPV6_NOTES.md`](IPV6_NOTES.md) | 原生 `/64` 共享、策略路由、NAT66 取舍与实测 |
+| [`TIME_NOTES.md`](TIME_NOTES.md) | 容器时钟/RTC 事故根因、修复与验证 |
 | [`MASTER_PLAN.md`](MASTER_PLAN.md) | 总计划、阶段执行记录、决策与剩余工作 |
 | [`RECOVERY_AND_ROLLBACK.md`](RECOVERY_AND_ROLLBACK.md) | 备份清单、Fastboot / 9008 回滚、软故障恢复 |
 | [`AVB_DISABLED.md`](AVB_DISABLED.md) | AVB / dm-verity 关闭记录与注意事项 |
@@ -268,6 +270,7 @@ adb shell su -c "sh /data/openwrt/scripts/04_start_openwrt_and_network.sh"
 8. **Android OTA 会覆盖 `boot` / `vbmeta`**：升级后要重新验证 KABI 并重新刷内核。
 9. **USB 网卡冷启动待验收**：当前只验证了 WAN-only 自启路径。
 10. **AG / Clash 未预装**：容器具备 `TPROXY` / `TUN` / iptables 能力，但需要自行部署，且只能用 iptables，不能用 nftables。
+11. **手机 RTC 不可写**：`hwclock -w` 返回 `RTC_SET_TIME: Permission denied`（Permissive 下也一样），RTC 仍停在 1970；Android 依靠 NTP 校正，容器已完全禁止读写 RTC。详见 [`TIME_NOTES.md`](TIME_NOTES.md)。
 
 ---
 

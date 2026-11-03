@@ -278,7 +278,8 @@ adb shell su -c "sh /data/openwrt/scripts/03_setup_openwrt_rootfs.sh"
 - 添加 `Allow-Host-UI` 规则：只允许 `10.200.1.1` 访问容器 80/443；
 - 把 `uhttpd.rfc1918_filter` 设为 `0`，否则宿主从 veth 访问会被当公网地址拒绝；
 - 用假 `modprobe` 绕过 OpenWrt 的 kmod 依赖（驱动已编进内核）；
-- 修补 dropbear init 的 `mktemp -d` 缺陷（否则会 `mv /* /etc/dropbear` 搬空 rootfs）。
+- 修补 dropbear init 的 `mktemp -d` 缺陷（否则会 `mv /* /etc/dropbear` 搬空 rootfs）；
+- **禁用容器 RTC/NTP 时间处理**：删除 `sysfixtime` / `sysntpd` 的 rc 链接，替换 `sysfixtime` 为 no-op，注释 `hwclock --systz`，关闭容器 NTP client。Android 拥有系统时钟，容器绝不能读写 `/dev/rtc0`。
 
 ### 6.4 启动容器与网络
 
@@ -318,6 +319,18 @@ default via <5G网关> dev <rmnet>        # 5G 默认
     - 宿主 table 200：`<prefix>/64 dev veth-host`；rule `iif <rmnet> lookup 200 pref 1000`；
     - 宿主 table 201：5G IPv6 默认；rule `from <prefix> lookup 201 pref 1001`；
     - 容器内 `odhcpd` 发 RA，客户端 SLAAC。
+
+补充的可靠性措施：
+
+- 启动前按 `/proc/<pid>/root` 清理整个容器进程树，避免失败启动泄漏 PID/netns；
+- `04` 用目录锁串行化，autorun 与手动执行不会并发创建 veth；
+- veth 用 toybox `ip link add name ... peer name ...`，并校验 peer 存在；
+- 等 PID namespace init 真正出现后再写 `container.pid`；
+- 容器 init 完成后把 `/dev/rtc0` / `/dev/rtc` 覆盖成 `/dev/null`；
+- 5G PDN 抖动时 `04` 重试 30 秒；autorun 等待 180 秒；
+- 找 5G 接口用 `ip -4 route show table all`，不依赖 Wi-Fi 可能占据的系统默认路由。
+
+> 时钟细节见 [`TIME_NOTES.md`](TIME_NOTES.md)。
 
 ### 6.5 开机自启
 
@@ -428,6 +441,11 @@ $BB nsenter -t "$P" -m -u -n -p -- /system/bin/chroot /data/openwrt/rootfs /bin/
 | 迁移路径后新守护不启动 | 旧守护仍以已删除路径运行，PID 文件有效 | 杀掉旧进程、清 pid、重启守护 |
 | 看门狗只拉容器不拉守护 | 自启循环缺守护检查 | 每 30 秒调用 `service_power_guard.sh` |
 | 开机“设备内部出现问题” | 内核缺 `CONFIG_OPLUS_FINGERPRINT*`，`fps_hal` 崩溃循环 | 打开 OPlus 指纹驱动；一次性提示点掉后不再出现 |
+| 容器启动后 Android 时间跳回 1970 | OpenWrt `sysfixtime` 用 `hwclock -s` 读宿主 RTC（停在 1970）并写入系统时钟；关机又 `hwclock -w` 写回 | `03` 禁用 `sysfixtime`/`sysntpd`/`hwclock --systz`；`04` 在 init 后把 `/dev/rtc0` 覆盖为 `/dev/null` |
+| 容器每 30 秒失败重启并泄漏几百个实例 | pid 文件指向 unshare wrapper；失败时只杀 wrapper；veth peer 未创建 | 按 `/proc/<pid>/root` 杀整个进程树；等 PID namespace init；toybox 显式 `name` 创建 veth 并校验 peer；`04` 加锁 |
+| `veth peer veth-owrt was not created` | 创建 veth 时 `ip` 解析到 BusyBox 或被并发 04 删除 | `04` 强制 toybox PATH；目录锁串行化；创建后校验 |
+| Wi-Fi 是默认路由时 autorun 一直等 5G / 04 选不到 WAN | `ip route get 8.8.8.8` 返回 `wlan0`，旧逻辑只认默认路由 | `find_rmnet_wan` 用 `ip -4 route show table all` 找 rmnet 默认；autorun 等 180 秒；`04` 重试 30 秒 |
+| 容器内 `date` 与宿主不一致 | 容器曾执行 `hwclock -s` / NTP | 容器禁用时间服务并隐藏 RTC；Android `auto_time=1`、`ntp_server=ntp.aliyun.com` |
 
 更完整的测试记录见 **[`TEST_REPORT.md`](TEST_REPORT.md)**。
 
