@@ -130,3 +130,42 @@ hwclock: ioctl RTC_SET_TIME: Permission denied
 4. 不要把 `/dev/rtc0` 重新暴露给容器；
 5. Android 的 `auto_time` 和 `ntp_server` 属于用户设置，恢复出厂/OTA 后要重新确认；
 6. `04.lock.d` 正常退出会自动删除；如果进程被 `kill -9`，下一次启动会检测 stale PID 并清理。
+
+---
+
+## 7. 待验证：RTC 断电测试（2026-11-03）
+
+用户准备做一次**完全关机、拔电、再开机**，用来判断 RTC 是“只是时间丢了”还是“备份供电/晶振坏了”。
+
+### 7.1 断电前基线（2026-11-03 23:51:28 CST）
+
+```text
+Android 时间:        2026-11-03 23:51:28 CST
+Android epoch:       1793721088
+RTC since_epoch:     799137
+RTC 时间:            1970-01-10 05:58:57 UTC
+Android uptime:      2599.71 秒（约 43 分钟）
+auto_time:           1
+ntp_server:          ntp.aliyun.com
+```
+
+### 7.2 开机后要记录
+
+```bash
+adb shell su -c "date; date +%s"
+adb shell su -c "cat /sys/class/rtc/rtc0/since_epoch"
+adb shell su -c "hwclock -r -u -f /dev/rtc0"
+adb shell su -c "cat /proc/uptime"
+```
+
+### 7.3 判读
+
+| 开机后现象 | 结论 |
+| :--- | :--- |
+| `since_epoch` 明显大于 799137（例如 +断电时长） | RTC 计数器和备份供电都正常，只是时间没校准 |
+| `since_epoch` 接近 799137，且 uptime 很小 | 可能没有真正断电，RTC 保持供电，测试无效 |
+| `since_epoch` 回到很小的值/再次停在 1970-01-09 附近 | RTC 备份供电或晶振有问题，属于硬件 |
+| `hwclock -r` 报错/读数不递增 | RTC 硬件或驱动异常 |
+
+> 注意：RTC 写入本身仍被 `RTC_SET_TIME: Permission denied` 挡住，所以即使 RTC 计数正常，也不能用 `hwclock -w` 校准；Android 继续靠 NTP。
+
