@@ -149,6 +149,17 @@ auto_time:           1
 ntp_server:          ntp.aliyun.com
 ```
 
+实际断电前最后一次快照（2026-11-03 23:52:58 CST，`reboot -p` 返回 `Done`，设备已断开 ADB）：
+
+```text
+Android epoch:       1793721178
+RTC since_epoch:     799226
+RTC 时间:            1970-01-10 06:00:26 UTC
+Android uptime:      2689.33 秒
+```
+
+> 这是真正用于对比的基线：开机后 `since_epoch` 应该大于 `799226`（如果 RTC 全程保持供电并计时）。
+
 ### 7.2 开机后要记录
 
 ```bash
