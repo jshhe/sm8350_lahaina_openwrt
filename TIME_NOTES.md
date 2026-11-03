@@ -180,3 +180,29 @@ adb shell su -c "cat /proc/uptime"
 
 > 注意：RTC 写入本身仍被 `RTC_SET_TIME: Permission denied` 挡住，所以即使 RTC 计数正常，也不能用 `hwclock -w` 校准；Android 继续靠 NTP。
 
+### 7.4 断电测试结果（2026-11-04 00:47:18 CST）
+
+```text
+Android 时间:        2026-11-04 00:47:18 CST
+Android epoch:       1793724438
+Android uptime:      40.67 秒（boot_completed=1）
+RTC since_epoch:     802487
+RTC 时间:            1970-01-10 06:54:47 UTC
+```
+
+与断电前基线对比：
+
+```text
+RTC:        802487 - 799226 = 3261 秒
+墙钟:       00:47:18 - 23:52:58 = 3260 秒
+偏差:       +1 秒
+```
+
+结论：
+
+- RTC 在关机/开机期间**连续计数**，没有归零；
+- 计数器、晶振和供电路径正常，**RTC 没有坏**；
+- 它只是没有被校准到 2026 年（epoch 停在 1970-01-10）；
+- `hwclock -w` 仍被 `RTC_SET_TIME: Permission denied` 拒绝，属于内核/固件写入限制；
+- Android 由 NTP 校正，容器不再接触 RTC，实际使用不受影响。
+
