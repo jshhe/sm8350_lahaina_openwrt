@@ -1,0 +1,8 @@
+# Large binary analysis artifacts; keep the extracted notes/source, not the blobs.
+*.apk
+*.so
+apk/
+
+# Local analysis helpers, not part of the CA handoff
+port-bridge
+lemonadep-proprietary-files.txt

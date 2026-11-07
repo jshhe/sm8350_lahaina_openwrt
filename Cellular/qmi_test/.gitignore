@@ -1,0 +1,10 @@
+# Build outputs (rebuild with build.ps1)
+qmi_nas_test
+qmi_band_set
+qmi_nas_test_2c
+qmi_probe
+qmi_lte_test
+qmi_restore_lte
+qmi_restore_nr
+qmi_set_n78
+dlopen_test

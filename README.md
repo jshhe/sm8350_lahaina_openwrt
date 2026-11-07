@@ -73,6 +73,7 @@ Android 宿主 + namespace/chroot 容器 + USB 网卡 netns 直通 + 5G 宿主 N
 | :--- | :---: | :--- |
 | Android 正常开机 / 图形界面 | ✅ | 1440×3216 120Hz，触控正常 |
 | 5G 数据 | ✅ | `rmnet_dataX` 获取 IPv4，容器内 ping `223.5.5.5` 0% 丢包 |
+| 5G CA（CMCC n41+n79） | ✅ | EFS 修复后 1100+ Mbps；详见 2.3 |
 | 原厂模块兼容 | ✅ | 99 个 `.ko` 的 1,607 个符号需求全部满足；`msm_drm` / `wlan` / `camera` / 音频实际加载正常 |
 | 指纹 | ✅ | `fps_hal=running`、`/dev/goodix_fp`、TEE `goodixfp` 正常 |
 | 音频 / 相机 / 内部 WiFi | ✅ | 均保持 Android 原生功能 |
@@ -88,6 +89,61 @@ Android 宿主 + namespace/chroot 容器 + USB 网卡 netns 直通 + 5G 宿主 N
 | 开机自启 | ⚠️ | WAN-only 路径已验证；插网卡冷启动待验收 |
 
 详细的测试过程、缺陷与修复记录见 **[`TEST_REPORT.md`](TEST_REPORT.md)**。
+
+### 2.3 5G 载波聚合（CMCC n41+n79）
+
+> 这部分是 **Android modem 配置修复**，与 OpenWrt 容器、内核无关，属于独立的 `Cellular/` 子项目。
+
+**现象**：OnePlus 9 Pro 在 CMCC SA 下默认只跑单载波。同一位置、同一时段：
+
+| 设备 / 配置 | 实测 |
+| :--- | ---: |
+| 小米 17 Pro Max，CA 关 | ~800 Mbps |
+| 小米 17 Pro Max，CA 开 | ~1200 Mbps |
+| 一加 9 Pro，修改前 | 800–900 Mbps |
+| 一加 9 Pro，修改后 | **1100+ Mbps** |
+
+**排除项**：n79 主载波实测 RSRP 约 -67 dBm / SINR 30；电池约 30.9°C；单卡；ColorOS Smart 5G 已关闭；同位置小米 CA 关 800 / 开 1200。因此不是信号弱、温控、双卡抢射频或网络负载。
+
+**根因**：一加 CMCC 运营商 MBN 把 TDD+TDD NR 载波聚合关掉了。对应 NV 项：
+
+```text
+/nv/item_files/modem/nr5g/RRC/cap_control_nrca_t_plus_t_band_combos
+```
+
+| 来源 | MBN 值 | 对应运行时值 |
+| :--- | :--- | :--- |
+| 一加通用 MBN | `07 01 01 01` | `01 01 01` |
+| 一加 CMCC `OPLUS_CMCC_OpenMkt` | `07 00 00 00` | **`00 00 00`** |
+| 小米 11 Pro CMCC `Volte_OpenMkt` | `07 01 01 01` | `01 01 01` |
+
+MBN 记录格式是 `02 00 <len> 00 <1 字节版本> <值>`，所以 4 字节 `07 00 00 00` 对应运行时 EFS 的 3 字节 `00 00 00`。一加 CMCC 的两条运行时 EFS（含 `_Subscription01`）已实测为 `00 00 00`；其余行是按 MBN 格式推导。n41 和 n79 都是 TDD，这一项就是 SA 下 T+T 聚合的开关。
+
+**修复方式**：不直接改 MBN 文件（modem 只在 MBN 版本变化时重新应用，改内容不触发），而是通过 USB diag + QCSuper 的 EFS shell 直接写运行时 NV：
+
+1. 手机切 `sys.usb.config=diag,adb`，Windows 用 Zadig 给 `22d9:276c` 的 Interface 0 装 WinUSB；
+2. **抓包/写 EFS 前必须停掉 adb server**，否则 libusb 打开复合设备会被 ADB 接口拒绝；
+3. 用 QCSuper `--efs-shell` 把 3 字节 `01 01 01` 写入两条路径：
+
+```text
+/nv/item_files/modem/nr5g/RRC/cap_control_nrca_t_plus_t_band_combos
+/nv/item_files/modem/nr5g/RRC/cap_control_nrca_t_plus_t_band_combos_Subscription01
+```
+
+4. 重启手机，让 modem 重新读取 EFS。
+
+EFS 写入重启后保持（已验证多次重启）。
+
+**注意事项**：
+
+- 直接改 `/data/vendor/modem_config/.../mcfg_sw.mbn` **无效**，因为 MBN 版本号没变，modem 会跳过；
+- 一加的 `mPhysicalChannelConfigs` 结构残缺（`mBand=0`、`mChannelNumber=invalid`、`mBandwidth=0`），QMI `Get RF Band Information` 也只报一组 band，**都不能可靠判断载波数**；
+- 最硬的证据是抓 RRC 看 `sCellToAddModList`；当前结论主要基于速度对比、EFS 值和持久性，RRC 抓包仍列为可选项；
+- 系统 OTA 可能重新应用 MBN 并覆盖 EFS，升级后若速度回落，用同样方法重新写入 `01 01 01`；
+- **还原**：把两条路径写回 `00 00 00`，重启。原厂 MBN 备份在 `/sdcard/Download/mcfg_sw.mbn.orig`，md5 `c6d360938f865863eb32daa3574a3630`；
+- 该操作只改 modem EFS，不碰 boot/kernel/分区，和 OpenWrt 的 `/data/openwrt/` 完全独立。
+
+完整命令、QCSuper 环境、采集/解析脚本和 QMI 测试工具见 **[`Cellular/README.md`](Cellular/README.md)**。
 
 ---
 
@@ -164,6 +220,7 @@ sm8350_lahaina/
 ├── scripts/                    # 03/04/05b/06、备份、KABI 校验
 ├── artifacts/                  # 构建产物（本地，不提交）
 ├── magisk_patch/               # 原厂 Root 回滚 boot（本地，不提交）
+├── Cellular/                   # 5G n41+n79 CA 修复、QMI/抓包工具与记录
 ├── full_backup_.../            # 手机原始分区备份（本地，不提交）
 ├── backup_merged_.../          # 合并后的恢复集（本地，不提交）
 ├── firmware_.../               # 官方固件解包（本地，不提交）
@@ -203,6 +260,7 @@ Magisk 只保留一个入口：
 | [`TEST_REPORT.md`](TEST_REPORT.md) | 已完成的测试、实验、缺陷与修复记录 |
 | [`IPV6_NOTES.md`](IPV6_NOTES.md) | 原生 `/64` 共享、策略路由、NAT66 取舍与实测 |
 | [`TIME_NOTES.md`](TIME_NOTES.md) | 容器时钟/RTC 事故根因、修复与验证 |
+| [`Cellular/README.md`](Cellular/README.md) | 5G n41+n79 载波聚合修复、QCSuper EFS 写入、还原与工具 |
 | [`MASTER_PLAN.md`](MASTER_PLAN.md) | 总计划、阶段执行记录、决策与剩余工作 |
 | [`RECOVERY_AND_ROLLBACK.md`](RECOVERY_AND_ROLLBACK.md) | 备份清单、Fastboot / 9008 回滚、软故障恢复 |
 | [`AVB_DISABLED.md`](AVB_DISABLED.md) | AVB / dm-verity 关闭记录与注意事项 |
@@ -271,6 +329,7 @@ adb shell su -c "sh /data/openwrt/scripts/04_start_openwrt_and_network.sh"
 9. **USB 网卡冷启动待验收**：当前只验证了 WAN-only 自启路径。
 10. **AG / Clash 未预装**：容器具备 `TPROXY` / `TUN` / iptables 能力，但需要自行部署，且只能用 iptables，不能用 nftables。
 11. **手机 RTC 不可写**：`hwclock -w` 返回 `RTC_SET_TIME: Permission denied`（Permissive 下也一样），RTC 仍停在 1970；Android 依靠 NTP 校正，容器已完全禁止读写 RTC。详见 [`TIME_NOTES.md`](TIME_NOTES.md)。
+12. **5G CA 依赖 modem EFS**：`n41+n79` 修复写在运行时 NV，不随 OpenWrt 容器；系统 OTA / 恢复出厂可能覆盖，需要复查并按 [`Cellular/README.md`](Cellular/README.md) 重新写入。
 
 ---
 
