@@ -302,21 +302,9 @@ adb shell su -c "sh /data/openwrt/scripts/04_start_openwrt_and_network.sh"
 
 ---
 
-## 7. 三个备份文件夹
 
-| 文件夹 | 是什么 | 文件数 | 大小 | 用途 |
-| :--- | :--- | :---: | :---: | :--- |
-| `full_backup_LE2120_14.0.0.1901/` | **手机原始全量备份**：117 个分区 `.img` + `by-name.txt` / `getprop.txt` / `FILELIST.txt` / `SHA256SUMS.txt` | 123 | 14.29 GiB | 原始证据、phone-only 分区来源 |
-| `backup_merged_LE2120_14.0.0.1901/` | **合并后的最终恢复集**：117 个 `.img`，其中 60 个物理分区用官方固件镜像（按手机分区大小补齐），57 个 phone-only 分区来自原始备份；附 `MANIFEST.md` + `SHA256SUMS.txt` | 119 | 14.29 GiB | **日常回滚/恢复用这一套** |
-| `firmware_LE2120_14.0.0.1901/` | 官方 OTA 解包出来的 43 个镜像（`boot.img`、`vendor_boot.img`、`modem.img` 等） | 43 | 8.84 GiB | 构建/对比的官方源材料，不是备份 |
 
-**结论：需要恢复手机分区时，用 `backup_merged_LE2120_14.0.0.1901/`。**
-
-它合并的原因是：`boot`、`vendor_boot`、`modem`、`xbl` 等 60 个物理分区直接取官方固件镜像更干净，避免把手机运行期的动态内容写回去；`modemst1/2`、`fsg`、`persist` 等 57 个 phone-only 分区必须保留手机原始数据。
-
----
-
-## 8. 已知限制
+## 7. 已知限制
 
 1. **21.02 已 EOL**：feed 冻结；换 23.05 需要禁用 `fw4`，换 24.10 还要处理 `apk`。
 2. **容器里的防火墙没有实际运行**：`fw3` 未启动，NAT/WAN 防火墙在 Android 宿主侧；容器内 `INPUT` 为空。不要把它当成安全边界。
@@ -333,7 +321,7 @@ adb shell su -c "sh /data/openwrt/scripts/04_start_openwrt_and_network.sh"
 
 ---
 
-## 9. 附录：官方内核源码调研
+## 8. 附录：官方内核源码调研
 
 一加官方在 [OnePlusOSS](https://github.com/OnePlusOSS) 下开源 SM8350 代码。一加 9 Pro 全生命周期基于 Linux 5.4（高通 GKI v1），Android 14 对应分支：
 
@@ -350,6 +338,6 @@ adb shell su -c "sh /data/openwrt/scripts/04_start_openwrt_and_network.sh"
 
 ---
 
-## 10. 许可
+## 9. 许可
 
 本项目代码以 **GPL-2.0** 发布，详见 [`LICENSE`](LICENSE) 与 [`NOTICE`](NOTICE)。Realtek 固件遵循其原始许可证。
