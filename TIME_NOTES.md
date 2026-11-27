@@ -73,7 +73,7 @@ mount --bind /dev/null /dev/rtc
 - `04` 对 5G PDN 抖动重试 30 秒；
 - autorun 用 `ip -4 route show table all` 找活跃 rmnet，不再依赖系统默认路由（Wi-Fi 可能是默认）；
 - 5G 冷启动等待延长到 180 秒；
-- 看门狗继续每 30 秒检查容器和电源守护。
+- 看门狗现已升级为 **5 秒**快速检查容器存活与 USB LAN 热挂，每第 6 拍（**30 秒**）执行 WAN、容器防火墙与电源守护检查。
 
 ### 3.3 Android 侧
 

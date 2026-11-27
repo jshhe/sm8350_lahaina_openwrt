@@ -10,8 +10,8 @@
 - **IPv6**：运营商 `/64` 原生共享，**不做 NAT66**。
 
 > **项目状态：可用，持续验证中。**
-> 最后一次上机验证：2026-11-27。Android 关键功能、内核、容器、IPv4/原生 IPv6、LuCI 中文、时间/RTC 隔离、带电扩展坞供电重插自愈以及**千兆 USB 网卡（RTL8153）免手操冷启动验收**均已通过。
-> 尚未完成：2.5G 网卡（RTL8156B/BG）冷启动复验、24–72 小时耐力测试，以及合入 `fix_oplus_warp_probe.patch` 新内核后的上机复验。
+> 最后一次上机验证：2026-11-27。Android 关键功能、CI Run #6 自定义内核（`45950059781`，含 `fix_oplus_warp_probe.patch` 且实测 `disable_warp_probe=Y` 零 `switch1_gpio:1`）、容器、IPv4/原生 IPv6、LuCI 中文、时间/RTC 隔离、千兆 USB 网卡（RTL8153）免手操冷启动、带电扩展坞 **USB 3.0（5000 Mbps）边充边用**，以及 **5 秒看门狗 + 原地热挂（11 秒全链路自愈）** 均已通过。
+> 尚未完成：2.5G 网卡（RTL8156B/BG）冷启动复验、24–72 小时耐力测试。
 
 ---
 
@@ -57,12 +57,11 @@ Android 宿主 + namespace/chroot 容器 + USB 网卡 netns 直通 + 5G 宿主 N
 | Bootloader | 已解锁 |
 | AVB / dm-verity | A 槽已关闭，`vbmeta_a` flags = `0x3` |
 | Root | Magisk 31.1 (`31.1:MAGISK:R`) |
-| 内核 | Linux `5.4.254-qgki-gd2a1055adeb0`（自定义，GitHub Actions run6，build `45950059781`，含 `disable_warp_probe=Y`） |
-| KABI | **1,607 / 1,607** 导出符号 CRC 与原厂 99 个 `.ko` 完全匹配 |
-| `Image` | 48,421,376 字节，SHA256 `aa9bcca8…97a8575` |
-| 当前 boot | `artifacts/kernel_run6/new-boot-custom-v4-magisk31.1.img`，SHA256 `eadf3cf3…ed1b73d7` |
-| 上一版备份 boot | `magisk_patch/boot_a_backup_run4_magisk31.1.img`，SHA256 `88d6088f…cd7f216` |
-| 原厂 Root 回滚 boot | `magisk_patch/magisk_patched_boot_v30.7.img`，SHA256 `a7fb4a0a…0161b4d3d` |
+| 内核 | Linux `5.4.254-qgki-gd2a1055adeb0`（`#1 SMP PREEMPT Fri Nov 27 06:15:42 UTC 2026`，GitHub Actions run6，build `45950059781`，含 `disable_warp_probe=Y`） |
+| KABI | **1,607 / 1,607** 导出符号 CRC 与原厂 99 个 `.ko` 完全匹配（开机实载 61 个原厂模块） |
+| `Image` | 48,421,376 字节，SHA256 `aa9bcca8f875851778b371b28ed4bac5f0f1ce94f0cee0ef201f33c3f97a8575` |
+| 当前 boot | `artifacts/kernel_run6/new-boot-custom-v4-magisk31.1.img`（201,326,592 字节，SHA256 `eadf3cf37bde2ea5402756eef01d68290be809d0d84bfd480a88fd22ed1b73d7`） |
+| 原厂 / 初始回滚备份 | 由用户保存在工作区外（原厂 Root boot 与 117 分区全量备份，工作区内不再留存旧备份 `.img`） |
 | OpenWrt | 21.02.7 `armvirt/64`，`fw3` + `iptables-legacy` |
 | 容器形式 | `unshare -m -u -n -p -f` + `chroot`，`procd` 是容器内 PID 1 |
 | LAN | `eth0` = `192.168.2.1/24`（USB 2.5G/1G 网卡） |
@@ -75,7 +74,7 @@ Android 宿主 + namespace/chroot 容器 + USB 网卡 netns 直通 + 5G 宿主 N
 | Android 正常开机 / 图形界面 | ✅ | 1440×3216 120Hz，触控正常 |
 | 5G 数据 | ✅ | `rmnet_dataX` 获取 IPv4，容器内 ping `223.5.5.5` 0% 丢包 |
 | 5G CA（CMCC n41+n79） | ✅ | EFS 修复后 1100+ Mbps；详见 2.3 |
-| 原厂模块兼容 | ✅ | 99 个 `.ko` 的 1,607 个符号需求全部满足；`msm_drm` / `wlan` / `camera` / 音频实际加载正常 |
+| 原厂模块兼容 | ✅ | 99 个 `.ko` 的 1,607 个符号需求全部满足；开机实载 61 个原厂模块，`msm_drm` / `wlan` / `camera` / 音频正常 |
 | 指纹 | ✅ | `fps_hal=running`、`/dev/goodix_fp`、TEE `goodixfp` 正常 |
 | 音频 / 相机 / 内部 WiFi | ✅ | 均保持 Android 原生功能 |
 | USB 2.5G 网卡 | ✅ | `r8152 v2.22.1` 已内置内核，Magisk 模块已移除 |
@@ -83,12 +82,12 @@ Android 宿主 + namespace/chroot 容器 + USB 网卡 netns 直通 + 5G 宿主 N
 | OpenWrt 服务 | ✅ | `procd` / `ubusd` / `uhttpd` / `dropbear` / `dnsmasq` / `odhcpd` / `fw3` |
 | LAN DHCP | ✅ | PC 自动获得 `192.168.2.227/24` |
 | LuCI | ✅ | 中文界面，PC `http://192.168.2.1/` 与手机浏览器 `http://10.200.1.2/` 均可访问 |
-| 容器防火墙 (`fw3`) | ✅ | `04` 末尾重启 + 30 秒看门狗自愈，`zone_wan_input`（`Allow-Host-UI`）与 `MASQUERADE` 生效 |
+| 容器防火墙 (`fw3`) | ✅ | `04` 末尾重启 + 看门狗每 30 秒双模式自愈（LAN 与 WAN-only 均覆盖），`zone_wan_input`（`Allow-Host-UI`）与 `MASQUERADE` 生效 |
 | IPv4 NAT | ✅ | LAN → veth → 宿主 MASQUERADE → 5G，PC ping `223.5.5.5` 0% 丢包 |
 | 原生 IPv6 | ✅ | PC 自动获得运营商 `/64`，宿主 `table 200` 经 `via fe80::2 onlink` 转发，ping `2400:3200::1` 0% 丢包 |
 | 电源守护 | ✅ | `cpu7=0`、A55 1.32GHz、A78 1.44GHz、60% 停充 / 50% 恢复 |
 | 宿主时间 | ✅ | 容器不再读写 RTC；重启后由 Android NTP 校正 |
-| USB Host 带电扩展坞自愈 | ✅ | `ensure_usb_host_mode()`（严守 `mode=peripheral`）重插 30–60 秒自动恢复并验证边充边用；配套 0-KABI 补丁 `fix_oplus_warp_probe.patch` |
+| USB 3.0 边充边用 & 快速原地热挂 | ✅ | Run #6 `disable_warp_probe=Y`（实测 25 次拦截、0 次 `switch1_gpio:1`）；`ensure_usb_host_mode()` 探测并缓存 `orientation` A/B 锁定 **USB 3.0 5000 Mbps** 边充边用；5 秒看门狗 + `attach_lan_inplace()` 实测断连 **11 秒**不重启 `procd` 自愈 |
 | 开机自启 | ✅ | 2026-11-27 千兆（RTL8153）免手操冷启动通过（单 `procd`、0 泄漏）；2.5G 网卡冷启动待复验 |
 
 详细的测试过程、缺陷与修复记录见 **[`TEST_REPORT.md`](TEST_REPORT.md)**。
@@ -201,7 +200,7 @@ EFS 写入重启后保持（已验证多次重启）。
 - 只有 USB 网卡被直通，容器拿到真实 LAN 口；
 - 容器内统一改名为 `eth0`，配置 `192.168.2.1/24`；
 - 宿主不再参与 LAN 侧 DHCP/NAT，避免双层 NAT；
-- 网卡热插拔与带电扩展坞供电重插由 `ensure_usb_host_mode()`（严守 `mode=peripheral` 不影响 PC USB）+ `04` 重新探测 + 30 秒看门狗自动热挂兜底。
+- 网卡热插拔与带电扩展坞供电重插由 **5 秒快速看门狗** + `ensure_usb_host_mode()`（支持 `data_role=[host]` 与带电非 PD 坞 `USB_DCP`，严守 `mode=peripheral` 不影响 PC USB，并探测/缓存 `orientation` A/B 锁定 **USB 3.0 5000 Mbps**，纯墙充退避 5 分钟）+ `attach_lan_inplace()` 原地热挂（不重启 `procd`、不断 `10.200.1.2`，重配 IPv4/原生 IPv6 `/64`/`table 200`，仅在失败时回退 `04`）兜底，实测断连 **11 秒**自愈。
 
 ### 3.6 IPv6
 
@@ -215,23 +214,23 @@ EFS 写入重启后保持（已验证多次重启）。
 
 ```text
 sm8350_lahaina/
-├── .github/workflows/          # 云端内核构建 + KABI 校验
+├── .github/workflows/          # 云端内核构建 + KABI 校验（build_kernel.yml）
 ├── configs/                    # 原厂 config、1,607 符号 CRC 黄金表
 ├── drivers/r8152/              # Realtek v2.22.1 驱动源码
 ├── firmware/rtl_nic/           # RTL8156 固件
 ├── anykernel/                  # AnyKernel3 配置
 ├── magisk/                     # r8152 兜底 Magisk 模块模板
-├── scripts/                    # 03/04/05b/06、备份、KABI 校验
+├── scripts/                    # 01/01b/02/03/04/05/05b/06、KABI 校验
+├── service_openwrt_autorun.sh  # 开机自启 + 5 秒看门狗 + USB 3.0 恢复 + 原地热挂
+├── service_power_guard.sh      # 电源守护拉起/防重复
 ├── fix_oplus_warp_probe.patch  # 0-KABI 内核补丁：默认跳过 OPLUS WARP D+/D- 探测
-├── artifacts/                  # 构建产物（本地，不提交）
-├── magisk_patch/               # 原厂 Root 回滚 boot（本地，不提交）
 ├── Cellular/                   # 5G n41+n79 CA 修复、QMI/抓包工具与记录
-├── full_backup_.../            # 手机原始分区备份（本地，不提交）
-├── backup_merged_.../          # 合并后的恢复集（本地，不提交）
-├── firmware_.../               # 官方固件解包（本地，不提交）
+├── artifacts/kernel_run6/      # 当前 Run #6 构建产物与活跃 boot（本地，不提交）
 ├── openwrt_rootfs/             # OpenWrt rootfs tar.gz（本地，不提交）
 └── *.md                        # 文档
 ```
+
+> 手机初始原厂 Root boot、117 分区全量备份与官方固件解包由用户在**工作区外**独立保管，本仓库工作区不再留存旧备份 `.img`（详见 [`RECOVERY_AND_ROLLBACK.md`](RECOVERY_AND_ROLLBACK.md)）。
 
 ### 4.2 手机运行目录（硬性规则）
 
@@ -243,7 +242,7 @@ OpenWrt 相关的包、软件、配置、脚本、镜像、状态、日志**只�
 ├── scripts/     # 03/04/05b、自启、守护脚本
 ├── packages/    # .ipk 包（如 luci-base）
 ├── images/      # rootfs tar.gz
-├── run/         # container.pid / power_guard.pid
+├── run/         # container.pid / power_guard.pid / usb3_orient
 └── logs/        # autorun / power_guard / network / init 日志
 ```
 
@@ -286,7 +285,7 @@ SUCCESS: 100% KABI CRC match with all 99 stock phone modules!
 
 ### 6.2 刷入
 
-推荐用 **Kernel Flasher** 刷 `AnyKernel3-OnePlus9Pro-OpenWrt-5.4.zip`（保留 Magisk ramdisk）；也可以直接 fastboot 刷已打包好的 `new-boot-custom-v3.img`。详见 `README_BUILD.md` 第四节。
+推荐用 **Kernel Flasher** 刷 `AnyKernel3-OnePlus9Pro-OpenWrt-5.4.zip`（保留 Magisk ramdisk）；也可以直接 fastboot 刷已打包好的 `artifacts/kernel_run6/new-boot-custom-v4-magisk31.1.img`。详见 [`README_BUILD.md`](README_BUILD.md) 第四节。
 
 ### 6.3 部署 OpenWrt
 
@@ -305,21 +304,36 @@ adb shell su -c "sh /data/openwrt/scripts/04_start_openwrt_and_network.sh"
 
 > 容器有独立 network namespace，手机浏览器的 `localhost` 访问不到容器；必须用 `10.200.1.2`。
 
+### 6.5 生产环境 USB 3.0（5000 Mbps）验证指南
+
+接入带电扩展坞 + USB 网卡后，判断是否真正跑在 **USB 3.0 SuperSpeed（5 Gbps）** 的**唯一权威依据**：
+
+- `/sys/bus/usb/devices/3-[1-9]*/speed` = **`5000`**（Mbps，挂在 `usb3` 总线）且 `version` = `3.00` / `3.20`；若降级到 USB 2.0，设备会出现在 `2-1`，`speed` = **`480`**；
+- 同时核对 `/sys/devices/platform/soc/a600000.ssusb/orientation`（`A` 或 `B`）与 `/sys/module/oplus_chg/parameters/disable_warp_probe` = **`Y`**。
+
+> **注意（防误判）**：
+> - `a600000.ssusb/speed` 返回 `super-speed` 只代表控制器**最大硬件能力**，不代表当前已协商 USB 3.0；
+> - `eth0` 的 RJ45 链路速率（`1000` / `2500` Mbps）只反映网线侧协商速度，**二者都不能证明 USB 侧跑在 USB 3.0**。
+
+一行核验命令：
+
+```bash
+adb shell su -c 'for d in /sys/bus/usb/devices/[23]-[1-9]*; do [ -f "$d/idVendor" ] && echo "$(basename $d) $(cat $d/idVendor):$(cat $d/idProduct) speed=$(cat $d/speed)Mbps usb=$(cat $d/version | tr -d " ") $(cat $d/product 2>/dev/null)"; done; echo "mode=$(cat /sys/devices/platform/soc/a600000.ssusb/mode) orient=$(cat /sys/devices/platform/soc/a600000.ssusb/orientation) warp_dis=$(cat /sys/module/oplus_chg/parameters/disable_warp_probe) power=$(cat /sys/class/typec/port0/power_role)"'
+```
+
 ---
-
-
 
 ## 7. 已知限制
 
 1. **21.02 已 EOL**：feed 冻结；换 23.05 需要禁用 `fw4`，换 24.10 还要处理 `apk`。
-2. **容器防火墙与宿主边界**：容器内 `fw3`（`iptables-legacy`）已由 `04` 末尾重启并由 30 秒看门狗 `ensure_container_fw()` 自动自愈（`Allow-Host-UI` 与 `MASQUERADE` 均生效），但无 user namespace/cgroup 隔离，外层 WAN 与原生 IPv6 转发边界仍在 Android 宿主侧。
+2. **容器防火墙与宿主边界**：容器内 `fw3`（`iptables-legacy`）已由 `04` 末尾重启并由看门狗每 30 秒（5 秒循环第 6 拍）在 LAN 与 WAN-only 双模式下调用 `ensure_container_fw()` 自动自愈（`Allow-Host-UI` 与 `MASQUERADE` 均生效），但无 user namespace/cgroup 隔离，外层 WAN 与原生 IPv6 转发边界仍在 Android 宿主侧。
 3. **没有 user namespace / cgroup 隔离**：容器 root 就是宿主 root。
 4. **Android 必须先启动**：容器由 Magisk `service.d` 在 Android 起来后拉起，不是独立双系统。
 5. **5G 对 OpenWrt 不可见**：没有 QMI/MBIM，WAN 依赖 Android 数据连接。
 6. **内部 WiFi 不能直通**：热点仍是 Android 的 AP，其客户端在 `192.168.69.0/24`，与容器 LAN 隔离。
 7. **IPv6 前缀变化不会自动刷新**：重拨后运营商 `/64` 可能变化，需要重跑 `04` 或重启；脚本目前只处理 `/64`。
 8. **Android OTA 会覆盖 `boot` / `vbmeta`**：升级后要重新验证 KABI 并重新刷内核。
-9. **2.5G 网卡冷启动与长稳测试待验收**：千兆 USB 网卡（RTL8153 `0bda:8153`，USB 3.0 5 Gbps）免手操冷启动已于 2026-11-27 通过，2.5G 网卡（RTL8156B/BG）冷启动及 24–72 小时耐力测试仍待验收；另非 PD 5V 扩展坞重启不会主动发 `PR_SWAP`，如需免重插边充边用请选标准 USB-PD 扩展坞。
+9. **2.5G 网卡冷启动与长稳测试待验收**：千兆 USB 网卡（RTL8153 `0bda:8153`，USB 3.0 5000 Mbps）免手操冷启动、Run #6 `disable_warp_probe=Y` 边充边用及 11 秒原地热挂均已于 2026-11-27 通过，2.5G 网卡（RTL8156B/BG）冷启动及 24–72 小时耐力测试仍待验收；另非 PD 5V 扩展坞重启不会主动发 `PR_SWAP`，如需免重插边充边用请选标准 USB-PD 扩展坞。
 10. **AG / Clash 未预装**：容器具备 `TPROXY` / `TUN` / iptables 能力，但需要自行部署，且只能用 iptables，不能用 nftables。
 11. **手机 RTC 不可写**：`hwclock -w` 返回 `RTC_SET_TIME: Permission denied`（Permissive 下也一样），RTC 仍停在 1970；Android 依靠 NTP 校正，容器已完全禁止读写 RTC。详见 [`TIME_NOTES.md`](TIME_NOTES.md)。
 12. **5G CA 依赖 modem EFS**：`n41+n79` 修复写在运行时 NV，不随 OpenWrt 容器；系统 OTA / 恢复出厂可能覆盖，需要复查并按 [`Cellular/README.md`](Cellular/README.md) 重新写入。

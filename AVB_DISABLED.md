@@ -6,7 +6,7 @@
 - 结果：`vbmeta_a` flags = `0x00000003`
   - bit 0 `VERIFICATION_DISABLED`
   - bit 1 `HASHTREE_DISABLED`
-- 当前状态（2026-11）：仍为 `0x3`，自定义内核与 Magisk 正常工作
+- 当前状态（2026-11-27）：仍为 `0x3`，自定义内核（CI Run #6 `45950059781`）与 Magisk 31.1 正常工作
 
 ## 刷写命令
 
@@ -16,8 +16,9 @@
 
 ```powershell
 $fb = ".tmp\platform-tools-34\platform-tools\fastboot.exe"
+$backup = "<你的外部备份路径>"
 & $fb --disable-verity --disable-verification flash vbmeta_a `
-    "firmware_LE2120_14.0.0.1901\vbmeta.img"
+    "$backup\firmware_LE2120_14.0.0.1901\vbmeta.img"
 ```
 
 实际只改了 vbmeta 头的 flags 字节（offset 123，`00` → `03`），没有改分区表或启动链。
@@ -36,7 +37,7 @@ AVB HASHTREE disabled on: /vendor
 ```
 
 `ro.boot.verifiedbootstate` 仍为 `orange`（Bootloader 已解锁，属正常）。
-Magisk 30.7 Root 正常。
+初始验证时为 Magisk 30.7，现已升级至 Magisk 31.1（`31.1:MAGISK:R`），Root 正常。
 
 ## 回滚
 
@@ -44,9 +45,10 @@ Magisk 30.7 Root 正常。
 
 ```powershell
 $fb = ".tmp\platform-tools-34\platform-tools\fastboot.exe"
-& $fb flash vbmeta_a "firmware_LE2120_14.0.0.1901\vbmeta.img"
+$backup = "<你的外部备份路径>"
+& $fb flash vbmeta_a "$backup\firmware_LE2120_14.0.0.1901\vbmeta.img"
 # 或者用合并后的恢复集：
-& $fb flash vbmeta_a "backup_merged_LE2120_14.0.0.1901\vbmeta_a.img"
+& $fb flash vbmeta_a "$backup\backup_merged_LE2120_14.0.0.1901\vbmeta_a.img"
 ```
 
 > 恢复官方 vbmeta 后，AVB 会重新启用。只要 Bootloader 仍解锁，自定义内核 + Magisk 仍可启动；但如果要回锁 Bootloader，必须先恢复所有官方分区。

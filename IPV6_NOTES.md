@@ -41,7 +41,7 @@ client:      2001:db8:1234:5678::2/64      (下级设备)
 
 - PC（`以太网 3`，RTL8153 1 Gbps）通过 USB 网卡经 SLAAC/RA 自动获得运营商同 `/64` 地址；
 - PC 可 ping 通容器 `eth0` 的 `::1`；
-- PC 可 ping 通外网 `2400:3200::1`（日常热修后实测 **34–53 ms**、冷启动免手操验收实测 **44–48 ms**，均为 **0% 丢包**）；
+- PC 可 ping 通外网 `2400:3200::1`（热修后实测 **34–53 ms**、冷启动免手操验收实测 **44–48 ms**、USB 断连原地热挂基准实测 **46–47 ms**，均为 **0% 丢包**）；
 - 容器内 `odhcpd` 正常发 RA；
 - 没有配置任何 NAT66 规则，也没有使用 ULA。
 
@@ -108,7 +108,7 @@ echo 1 > /proc/sys/net/ipv6/conf/<rmnet>/forwarding
 echo 1 > /proc/sys/net/ipv6/conf/veth-host/forwarding
 ```
 
-Android netd 会在网络变化时重置这些值，自启看门狗每 30 秒重新断言。
+Android netd 会在网络变化时重置这些值，自启看门狗每 30 秒（5 秒循环第 6 拍）重新断言；此外，当 USB 网卡热插拔或供电重插重新枚举时，`service_openwrt_autorun.sh` 的 `attach_lan_inplace()` 会原地将 `eth0` 挂回容器 netns，并同步重配原生 IPv6 `/64`、`table 200`（`via fe80::2 onlink`）及 `odhcpd`，无需重启 `procd`。
 
 ### 3.5 RA / DHCPv6
 
@@ -140,7 +140,7 @@ option ra_dns '1'
 1. **只处理 `/64`**：如果运营商给 `/56` / `/60`，脚本不会自动切前缀长度；
 2. **前缀变化不自动刷新**：5G 重拨后运营商可能换 `/64`，当前需要重跑 `04` 或重启手机；
 3. **没有 NDP proxy**：依赖运营商把整个 `/64` 路由到 UE；实测当前网络可用，但换运营商可能需要在 `rmnet` 上补 proxy NDP；
-4. **IPv6 公网暴露边界需自行审视**：容器内 `fw3`（`iptables-legacy`）已正常运行并由看门狗自愈（`Allow-Host-UI` 与 IPv4 `MASQUERADE` 均生效），但 LAN 客户端持有运营商公网 `/64` 地址且入口经由 Android 宿主转发，如需严格 IPv6 入站隔离请额外核查容器 `ip6tables` 规则；
+4. **IPv6 公网暴露边界需自行审视**：容器内 `fw3`（`iptables-legacy`）已正常运行并由看门狗每 30 秒在 LAN 与 WAN-only 双模式下自动自愈（`Allow-Host-UI` 与 IPv4 `MASQUERADE` 均生效），但 LAN 客户端持有运营商公网 `/64` 地址且入口经由 Android 宿主转发，如需严格 IPv6 入站隔离请额外核查容器 `ip6tables` 规则；
 5. **热点客户端不共享**：Android 热点仍是独立网络，与容器 LAN 隔离。
 
 ---

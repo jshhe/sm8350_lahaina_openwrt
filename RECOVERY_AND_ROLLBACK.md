@@ -2,7 +2,7 @@
 
 > 设备：OnePlus 9 Pro / `lemonadep` / LE2120
 > 当前固件：`LE2120_14.0.0.1901`
-> 前提：Bootloader 已解锁、AVB 已关闭、Magisk 30.7
+> 前提：Bootloader 已解锁、AVB 已关闭、Magisk 31.1（`31.1:MAGISK:R`）
 > 原则：**先判断故障在哪一层，不要一上来就全量刷机。**
 
 ---
@@ -20,9 +20,11 @@
 
 ## 1. 备份与镜像清单
 
-### 1.1 三个备份文件夹
+### 1.1 外部备份集（用户工作区外保管）
 
-| 文件夹 | 内容 | 用途 |
+> 原始 117 分区备份、合并恢复集、官方固件解包与初始原厂 Root boot 均由用户在**工作区外**独立保管，不再留存于本仓库目录内（原工作区临时旧备份 `.img` 已清理）。下文命令中的 `$backup` 表示你的外部备份根目录。
+
+| 文件夹（外部备份） | 内容 | 用途 |
 | :--- | :--- | :--- |
 | `full_backup_LE2120_14.0.0.1901/` | 手机原始 117 分区 + `by-name.txt` / `getprop.txt` / `FILELIST.txt` / `SHA256SUMS.txt` | 原始证据、phone-only 分区来源 |
 | `backup_merged_LE2120_14.0.0.1901/` | 117 分区最终恢复集：60 个物理分区用官方镜像，57 个 phone-only 来自手机；附 `MANIFEST.md` + `SHA256SUMS.txt` | **恢复时优先用这一套** |
@@ -30,12 +32,11 @@
 
 ### 1.2 当前 boot 镜像
 
-| 文件 | 内容 | SHA256 |
-| :--- | :--- | :--- |
-| `artifacts/kernel_run6/new-boot-custom-v4-magisk31.1.img` | Magisk 31.1 ramdisk + 自定义内核 run6（含 `disable_warp_probe`） | `eadf3cf37bde2ea5402756eef01d68290be809d0d84bfd480a88fd22ed1b73d7` |
-| `magisk_patch/boot_a_backup_run4_magisk31.1.img` | Magisk 31.1 + 自定义内核 run4（刷 run6 前备份） | `88d6088facbd237f83e0e627ae978dbbff08db43114336145e11d3b12cd7f216` |
-| `magisk_patch/magisk_patched_boot_v30.7.img` | 原厂内核 + Magisk 30.7（原厂回滚基准） | `a7fb4a0a65508861cbb235ada0f1e75fca9e23840a0da88a8f6799e0161b4d3d` |
-| `firmware_LE2120_14.0.0.1901/boot.img` | 官方原厂 boot（未 Root） | 见官方包 |
+| 文件 | 位置 | 内容 | SHA256 |
+| :--- | :--- | :--- | :--- |
+| `artifacts/kernel_run6/new-boot-custom-v4-magisk31.1.img` | 本地工作区（当前活跃产物，201,326,592 B） | Magisk 31.1 ramdisk + 自定义内核 Run #6（build `45950059781`，含 `disable_warp_probe=Y`） | `eadf3cf37bde2ea5402756eef01d68290be809d0d84bfd480a88fd22ed1b73d7` |
+| `<你的外部备份路径>\stock_magisk_boot.img` | 外部备份 | 原厂内核 + 初始 Magisk Root（原厂回滚基准） | 见外部备份校验记录 |
+| `<你的外部备份路径>\firmware_LE2120_14.0.0.1901\boot.img` | 外部备份 | 官方原厂 boot（未 Root） | 见官方包 |
 
 ### 1.3 快速工具
 
@@ -113,14 +114,16 @@ adb shell su -c "rm -f /data/openwrt/disable_autorun"
 
 ### 2.5 扩展坞 USB Host / 容器 `fw3` / WARP 快充开关快速排查
 
-- **手机浏览器打不开 `http://10.200.1.2/` 或 PC 无外网**：确认容器 `fw3` 规则存在（看门狗每 30 秒也会自动自愈）：
+- **手机浏览器打不开 `http://10.200.1.2/` 或 PC 无外网**：确认容器 `fw3` 规则存在（看门狗每 30 秒，即 5 秒循环的第 6 拍，会在 LAN 与 WAN-only 双模式下自动自愈）：
   ```bash
   adb shell su -c "P=\$(cat /data/openwrt/run/container.pid); /data/adb/magisk/busybox nsenter -t \$P -m -u -n -p -- /system/bin/chroot /data/openwrt/rootfs /bin/sh -c 'export PATH=/usr/sbin:/usr/bin:/sbin:/bin; iptables -t nat -S zone_wan_postrouting; iptables -S zone_wan_input'"
   ```
-- **带电扩展坞重插后 `eth0` 未立即出现**：等待 30–60 秒由 `ensure_usb_host_mode()` + 看门狗自动恢复；若使用非 PD 5V 扩展坞且冷重启后未充电（`power_role=[source]`），拔插一次扩展坞供电即可切回 `[sink]` 并在 30–60 秒内自动挂回 `eth0`。
-- **含 `fix_oplus_warp_probe.patch` 的内核如需临时恢复原厂 WARP 快充**（直插原装快充头、不接扩展坞时），无需重刷内核，直接运行时切换参数：
+- **带电扩展坞重插后 `eth0` 未立即出现**：5 秒看门狗会自动调用 `ensure_usb_host_mode()`（探测并缓存 `a600000.ssusb/orientation` A/B 至 `/data/openwrt/run/usb3_orient`，锁定 USB 3.0 5000 Mbps）并执行 `attach_lan_inplace()` 原地热挂（不重启 `procd`、不断 `10.200.1.2`，实测约 **11 秒**自愈；仅在原地挂载失败时回退 `04` 重启）。若使用非 PD 5V 扩展坞且冷重启后未充电（`power_role=[source]`），拔插一次扩展坞供电即可切回 `[sink]` 并自动挂回 `eth0`。
+- **Run #6 内核（含 `fix_oplus_warp_probe.patch`）如需临时恢复原厂 WARP 快充**（直插原装快充头、不接扩展坞时），无需重刷内核，直接运行时切换参数：
   ```bash
-  # 临时恢复 WARP 探测（重启后自动恢复默认禁用 1）
+  # 确认当前状态（Run #6 默认 Y，权限 0644）
+  adb shell su -c "cat /sys/module/oplus_chg/parameters/disable_warp_probe"
+  # 临时恢复 WARP 探测（重启后自动恢复默认禁用 1 / Y）
   adb shell su -c "echo 0 > /sys/module/oplus_chg/parameters/disable_warp_probe"
   # 重新禁用 WARP 探测（保护 USB Host 网卡）
   adb shell su -c "echo 1 > /sys/module/oplus_chg/parameters/disable_warp_probe"
@@ -144,23 +147,24 @@ $fb = ".tmp\platform-tools-34\platform-tools\fastboot.exe"
 
 ### 3.2 刷回原厂 Magisk boot
 
-当前活动槽是 `a` 时：
+先将 `$backup` 指向你的外部备份目录。当前活动槽是 `a` 时：
 
 ```powershell
-& $fb flash boot_a magisk_patch\magisk_patched_boot_v30.7.img
+$backup = "<你的外部备份路径>"
+& $fb flash boot_a "$backup\stock_magisk_boot.img"
 & $fb reboot
 ```
 
 如果 `current-slot` 是 `b`：
 
 ```powershell
-& $fb flash boot_b magisk_patch\magisk_patched_boot_v30.7.img
+& $fb flash boot_b "$backup\stock_magisk_boot.img"
 & $fb reboot
 ```
 
 这会恢复原厂内核 + Magisk，**不动数据分区**。
 
-### 3.3 恢复自定义内核
+### 3.3 恢复自定义内核（Run #6）
 
 ```powershell
 & $fb flash boot_a artifacts\kernel_run6\new-boot-custom-v4-magisk31.1.img
@@ -170,7 +174,7 @@ $fb = ".tmp\platform-tools-34\platform-tools\fastboot.exe"
 ### 3.4 完全没有 Root 的原厂 boot
 
 ```powershell
-& $fb flash boot_a firmware_LE2120_14.0.0.1901\boot.img
+& $fb flash boot_a "$backup\firmware_LE2120_14.0.0.1901\boot.img"
 & $fb reboot
 ```
 
@@ -187,25 +191,26 @@ $fb = ".tmp\platform-tools-34\platform-tools\fastboot.exe"
 ### 4.1 恢复启动相关
 
 ```powershell
-& $fb flash vendor_boot_a backup_merged_LE2120_14.0.0.1901\vendor_boot_a.img
-& $fb flash dtbo_a backup_merged_LE2120_14.0.0.1901\dtbo_a.img
+$backup = "<你的外部备份路径>"
+& $fb flash vendor_boot_a "$backup\backup_merged_LE2120_14.0.0.1901\vendor_boot_a.img"
+& $fb flash dtbo_a "$backup\backup_merged_LE2120_14.0.0.1901\dtbo_a.img"
 & $fb reboot
 ```
 
 ### 4.2 恢复基带 / 校准（谨慎）
 
 ```powershell
-& $fb flash modem_a backup_merged_LE2120_14.0.0.1901\modem_a.img
-& $fb flash modemst1 backup_merged_LE2120_14.0.0.1901\modemst1.img
-& $fb flash modemst2 backup_merged_LE2120_14.0.0.1901\modemst2.img
-& $fb flash fsg backup_merged_LE2120_14.0.0.1901\fsg.img
+& $fb flash modem_a "$backup\backup_merged_LE2120_14.0.0.1901\modem_a.img"
+& $fb flash modemst1 "$backup\backup_merged_LE2120_14.0.0.1901\modemst1.img"
+& $fb flash modemst2 "$backup\backup_merged_LE2120_14.0.0.1901\modemst2.img"
+& $fb flash fsg "$backup\backup_merged_LE2120_14.0.0.1901\fsg.img"
 & $fb reboot
 ```
 
 `persist` 一般不要动；只有传感器/指纹校准确实损坏时才考虑：
 
 ```powershell
-& $fb flash persist backup_merged_LE2120_14.0.0.1901\persist.img
+& $fb flash persist "$backup\backup_merged_LE2120_14.0.0.1901\persist.img"
 ```
 
 ### 4.3 验证
@@ -252,13 +257,14 @@ adb shell su -c "dmesg | grep -iE 'wlan|modem|fingerprint' | tail -30"
 重新关闭：
 
 ```powershell
-& $fb --disable-verity --disable-verification flash vbmeta_a firmware_LE2120_14.0.0.1901\vbmeta.img
+$backup = "<你的外部备份路径>"
+& $fb --disable-verity --disable-verification flash vbmeta_a "$backup\firmware_LE2120_14.0.0.1901\vbmeta.img"
 ```
 
 恢复官方：
 
 ```powershell
-& $fb flash vbmeta_a backup_merged_LE2120_14.0.0.1901\vbmeta_a.img
+& $fb flash vbmeta_a "$backup\backup_merged_LE2120_14.0.0.1901\vbmeta_a.img"
 ```
 
 > **不要在 vbmeta 被修改的情况下重新锁 Bootloader。** 先刷回官方 vbmeta，再回锁。
@@ -267,12 +273,12 @@ adb shell su -c "dmesg | grep -iE 'wlan|modem|fingerprint' | tail -30"
 
 ## 7. 校验备份完整性
 
-在仓库根目录（Windows PowerShell 没有 `sha256sum` 时可用 Python）：
+在你的外部备份目录（Windows PowerShell 没有 `sha256sum` 时可用 Python）：
 
 ```powershell
 python -c "
 import hashlib, pathlib
-root = pathlib.Path('backup_merged_LE2120_14.0.0.1901')
+root = pathlib.Path(r'<你的外部备份路径>\backup_merged_LE2120_14.0.0.1901')
 bad = []
 for line in (root/'SHA256SUMS.txt').read_text().splitlines():
     if not line.strip(): continue
@@ -289,7 +295,7 @@ print('bad:', bad if bad else 'none')
 Linux / Git Bash：
 
 ```bash
-cd backup_merged_LE2120_14.0.0.1901
+cd "<你的外部备份路径>/backup_merged_LE2120_14.0.0.1901"
 sha256sum -c SHA256SUMS.txt
 ```
 
@@ -311,9 +317,9 @@ sha256sum -c SHA256SUMS.txt
 
 ```text
 只坏 OpenWrt  → 停自启、看日志、重跑 03/04
-刷内核不开机  → fastboot flash boot_a magisk_patched_boot_v30.7.img
+刷内核不开机  → fastboot flash boot_a "<你的外部备份路径>\stock_magisk_boot.img"
 WiFi/5G 异常  → 恢复 vendor_boot_a / dtbo_a / modemst1/2 / fsg
 彻底黑屏      → 9008 EDL + MSM
 ```
 
-只要 117 分区备份和 `magisk_patched_boot_v30.7.img` 在，手机可以救回来。
+只要外部保管的 117 分区备份和原厂 Root boot 在，手机可以救回来。

@@ -1,11 +1,11 @@
 # 测试与实验报告
 
 > 设备：OnePlus 9 Pro / `lemonadep` / LE2120（国行）
-> 系统：OOS 14 `LE2120_14.0.0.1901`
-> 内核：`5.4.254-qgki-gd2a1055adeb0`（自定义，GitHub Actions build `40346641157` / run4）
+> 系统：OOS 14 `LE2120_14.0.0.1901`（Magisk `31.1:MAGISK:R`）
+> 内核：`5.4.254-qgki-gd2a1055adeb0`（`#1 SMP PREEMPT Fri Nov 27 06:15:42 UTC 2026`，GitHub Actions build `45950059781` / run6，含 `fix_oplus_warp_probe.patch`）
 > OpenWrt：21.02.7 `armvirt/64`
 > 最后一次上机：2026-11-27
-> 结论：**主链路与千兆 USB 网卡（RTL8153）免手操冷启动验收已通过**；2.5G 网卡冷启动复验、24–72 小时耐力测试、含 `fix_oplus_warp_probe.patch` 新内核上机验证以及 23.05 用户态 / AG / Clash 属于待验收/可选项。
+> 结论：**主链路、Run #6 WARP 补丁内核、千兆 USB 网卡（RTL8153）免手操冷启动、带电扩展坞 USB 3.0（5000 Mbps）边充边用以及 5 秒看门狗原地热挂（11 秒全链路自愈）均已通过**；2.5G 网卡（RTL8156B/BG）冷启动复验、24–72 小时耐力测试及 23.05 用户态 / AG / Clash 属于待验收/可选项。
 
 ---
 
@@ -13,11 +13,12 @@
 
 | 类别 | 项目 | 结果 |
 | :--- | :--- | :---: |
-| Boot | Bootloader 解锁 / AVB 关闭 / Magisk 30.7 | ✅ |
-| Boot | 自定义内核开机 | ✅ |
-| Kernel | KABI 1,607 符号 CRC | ✅ |
-| Kernel | `RELR=n` / `PID_NS=y` / 指纹驱动 | ✅ |
+| Boot | Bootloader 解锁 / AVB 关闭 / Magisk 31.1 (`31.1:MAGISK:R`) | ✅ |
+| Boot | 自定义内核 Run #6 开机 | ✅ |
+| Kernel | KABI 1,607/1,607 符号 CRC（开机实载 61 个原厂模块） | ✅ |
+| Kernel | `RELR=n` / `PID_NS=y` / 指纹驱动（`fps_hal=running`） | ✅ |
 | Kernel | 内置 `r8152 v2.22.1` | ✅ |
+| Kernel | 0-KABI 补丁 `disable_warp_probe=Y`（25 次拦截，0 次 `switch1_gpio:1`） | ✅ |
 | Android | 显示 / 触控 / 音频 / 相机 / WiFi | ✅ |
 | Android | 指纹 / TEE | ✅ |
 | Android | 5G 数据 | ✅ |
@@ -30,11 +31,11 @@
 | Network | LAN DHCP / NAT / 5G 出口 | ✅ |
 | Network | 宿主访问容器 LuCI | ✅ |
 | IPv6 | 原生 `/64` / RA / `table 200 via fe80::2` / 外网 | ✅ |
-| Firewall | 容器 `fw3`（`Allow-Host-UI` + `MASQUERADE`）自愈 | ✅ |
+| Firewall | 容器 `fw3`（`Allow-Host-UI` + `MASQUERADE`）LAN/WAN-only 双模式自愈 | ✅ |
 | LuCI | 中文界面（PC `192.168.2.1` + 手机 `10.200.1.2`） | ✅ |
 | Autostart | Magisk `ASH_STANDALONE` 隔离 + 单容器防泄漏 | ✅ |
-| Autostart | WAN-only 自启 / 看门狗 | ✅ |
-| USB Host | 带电扩展坞供电重插 30–60s 自愈 + 边充边用 | ✅ |
+| Autostart | WAN-only 自启 / 5s 看门狗 + 30s 周期检查 | ✅ |
+| USB 3.0 & Hot-Attach | 带电扩展坞 USB 3.0 5000 Mbps（`orientation=A/B` 缓存）边充边用 + 原地热挂 11s 自愈 | ✅ |
 | Clock | 容器不再改写 Android 时钟 | ✅ |
 | Clock | 重启后 NTP 自动校正 | ✅ |
 | Cleanup | 泄漏实例/进程树清理 | ✅ |
@@ -48,12 +49,12 @@
 
 ### 2.1 构建迭代
 
-| 构建 | 产物 | 说明 |
+| 构建 | 产物状态 | 说明 |
 | :--- | :--- | :--- |
-| run2 | `artifacts/kernel_run2/` | 早期打通编译链路，保留作对照 |
-| run3 | `artifacts/kernel_run3/` | 加入 `Module.symvers`，继续修配置 |
-| run4 | `artifacts/kernel_run4/`（已归档移除） | 首个全功能版：KABI 100%，指纹/2.5G/PID_NS 就绪 |
-| **run6** | `artifacts/kernel_run6/` | **当前在网版本**：在 run4 基础上合入 `fix_oplus_warp_probe.patch`（0-KABI），实测 `disable_warp_probe=Y` 零 `switch1_gpio:1`、USB 3.0 5000 Mbps 与 `sink` 供电共存、5s 看门狗 + 原地热挂 11s 恢复 |
+| run2 | 历史构建（本地产物已清理） | 早期打通编译链路 |
+| run3 | 历史构建（本地产物已清理） | 加入 `Module.symvers`，继续修配置 |
+| run4 | 历史构建（本地产物已清理） | 首个全功能版：KABI 100%，指纹/2.5G/PID_NS 就绪 |
+| **run6** | **`artifacts/kernel_run6/`（当前在网版本）** | 在 run4 基础上合入 `fix_oplus_warp_probe.patch`（0-KABI），实测 `disable_warp_probe=Y` 零 `switch1_gpio:1`、USB 3.0 5000 Mbps 与 `sink` 供电共存、5s 看门狗 + 原地热挂 11s 恢复 |
 
 run6 关键数据：
 
@@ -61,10 +62,10 @@ run6 关键数据：
 build:        45950059781
 uname -v:     #1 SMP PREEMPT Fri Nov 27 06:15:42 UTC 2026
 Image:        48,421,376 bytes
-SHA256:       aa9bcca8f875851778b371b28ed4bac5f0f1ce94f0cee0ef201f33c3f97a8575
-boot image:   new-boot-custom-v4-magisk31.1.img (201,326,592 bytes)
+Image SHA256: aa9bcca8f875851778b371b28ed4bac5f0f1ce94f0cee0ef201f33c3f97a8575
+boot image:   artifacts/kernel_run6/new-boot-custom-v4-magisk31.1.img (201,326,592 bytes)
 boot SHA256:  eadf3cf37bde2ea5402756eef01d68290be809d0d84bfd480a88fd22ed1b73d7
-```
+KABI:         1,607 / 1,607 matched (61 vendor modules loaded, fps_hal=running, Magisk 31.1:MAGISK:R)
 ```
 
 ### 2.2 KABI 校验
@@ -111,15 +112,15 @@ CONFIG_LOCALVERSION="-qgki-gd2a1055adeb0"
 
 ### 2.4 内核刷入
 
-- 当前 `boot_a`：`new-boot-custom-v3.img`；
-- `uname -r`：`5.4.254-qgki-gd2a1055adeb0`；
-- 回滚基准：`magisk_patch/magisk_patched_boot_v30.7.img`（原厂内核 + Magisk 30.7）。
+- 当前 `boot_a`：`artifacts/kernel_run6/new-boot-custom-v4-magisk31.1.img`（201,326,592 B，SHA256 `eadf3cf37bde2ea5402756eef01d68290be809d0d84bfd480a88fd22ed1b73d7`）；
+- `uname -a`：`Linux localhost 5.4.254-qgki-gd2a1055adeb0 #1 SMP PREEMPT Fri Nov 27 06:15:42 UTC 2026 aarch64`；
+- 回滚基准：用户保存于工作区外的原厂 Root boot 与 117 分区全量备份（工作区内原旧备份 `.img` 已清理）。
 
 ### 2.5 原厂模块与驱动
 
 | 项目 | 结果 |
 | :--- | :--- |
-| 99 个原厂 `.ko` 的符号需求 | ✅ 1,607/1,607 匹配，无 missing/mismatch |
+| 99 个原厂 `.ko` 的符号需求 | ✅ 1,607/1,607 匹配，无 missing/mismatch；开机实载 61 个原厂模块（`lsmod` 62 行含表头） |
 | `msm_drm` | ✅ 显示正常 |
 | `wlan` / `qcacld` | ✅ 内部 WiFi 正常 |
 | `camera` | ✅ 相机正常 |
@@ -323,8 +324,9 @@ ip rule:
 | 13 | 守护挂了没人拉 | 看门狗只检查容器 | 每 30 秒调用守护 |
 | 14 | Magisk `service.d` 下 `veth-owrt` 失败且每 30s 泄漏容器 | Magisk 在 BusyBox ash `ASH_STANDALONE=1` 模式运行（忽略 `PATH`），BusyBox `ip`/`ps` 缺失所需能力 | `00_openwrt.sh`/`autorun`/`04` 三层 `unset ASH_STANDALONE` + `exec /system/bin/sh` + 严格 `pgrep -P` |
 | 15 | PC 原生 IPv6 ping 外网 100% 丢包 | 宿主 `table 200` 缺下一跳（`dev veth-host`），Android 在 `veth-host` 上对 LAN 客户端发 NDP 解析失败 | 改为 `via fe80::2 dev veth-host onlink table 200`，PC ping `2400:3200::1` 恢复 34–53 ms、0% 丢包 |
-| 16 | 冷启动后容器 `fw3` 规则不完整 | `04` 与 `procd`/`S19firewall` 及异步 `netifd reload` 竞态 | 将 `/etc/init.d/firewall restart` 移到 `04` 末尾校验重试，看门狗新增 `ensure_container_fw()` 自愈 |
-| 17 | 带电扩展坞重插后 `eth0` 掉线、`error -71` | 非 PD 5V 坞 VBUS 触发 `oplus_otg_disable_work`（`mode=none`），充电时 OPLUS WARP 探测切 `switch1_gpio:1` 抢占 D+/D- | 用户态新增 `ensure_usb_host_mode()`（保护 `mode=peripheral`）+ 热挂看门狗；内核新增 0-KABI 补丁 `fix_oplus_warp_probe.patch` |
+| 16 | 冷启动后容器 `fw3` 规则不完整 | `04` 与 `procd`/`S19firewall` 及异步 `netifd reload` 竞态 | 将 `/etc/init.d/firewall restart` 移到 `04` 末尾校验重试，看门狗每 30 秒（5s 循环第 6 拍）在 LAN 与 WAN-only 双模式执行 `ensure_container_fw()` 自愈 |
+| 17 | 带电扩展坞重插后 `eth0` 掉线、`error -71` | 非 PD 5V 坞 VBUS 触发 `oplus_otg_disable_work`（`mode=none`），充电时 OPLUS WARP 探测切 `switch1_gpio:1` 抢占 D+/D- | Run #6 合入 0-KABI 补丁 `fix_oplus_warp_probe.patch`（`disable_warp_probe=Y`，实测 25 次拦截/0 次 `switch1_gpio:1`）；用户态升级为 5s 看门狗 + `ensure_usb_host_mode()`（严守 `mode=peripheral`）+ `attach_lan_inplace()` 原地热挂（11s 自愈） |
+| 18 | 恢复 USB Host 后网卡降级为 USB 2.0（480 Mbps） | 手动写 `mode=host` 缺少 Type-C 极性事件，`ss_phy` 未设 `PHY_LANE_A/B` | `ensure_usb_host_mode()` 探测 `a600000.ssusb/orientation`（`A`/`B`）并缓存至 `/data/openwrt/run/usb3_orient`，锁定 `usb 3-1` **5000 Mbps** 边充边用 |
 
 ---
 
@@ -354,12 +356,14 @@ ip rule:
   └── exec /system/bin/sh /data/openwrt/scripts/service_openwrt_autorun.sh
 ```
 
-已验证（WAN-only + 2026-11-27 千兆 RTL8153 冷启动与供电重插自愈）：
+已验证（WAN-only + 2026-11-27 千兆 RTL8153 冷启动 + Run #6 + 5s 看门狗原地热挂 11s 基准）：
 
 - 脚本先清除 `ASH_STANDALONE` 并切换到 Android `/system/bin/sh`，等待 `sys.boot_completed=1` 与 5G 活跃路由（最多 180 秒）；
-- 调用 `ensure_usb_host_mode()`（严守 `mode=peripheral` 不碰 PC USB）并等待 USB 网卡（最多 30 秒）；
+- 调用 `ensure_usb_host_mode()`（支持 `data_role=[host]` 及带电非 PD 坞 `USB_DCP`，严守 `mode=peripheral` 不碰 PC USB，探测并缓存 `orientation` A/B 至 `/data/openwrt/run/usb3_orient` 锁定 USB 3.0 5000 Mbps）并等待 USB 网卡（最多 30 秒）；
 - 容器未运行时以 `/system/bin/sh` 执行 `04`，`eth0` 未出现时先以 WAN-only 启动；
-- 每 30 秒看门狗：`ensure_wan()` 重断言转发/路由/宿主 `iptables`；拉起电源守护；容器异常时重启；容器为 WAN-only 且检测到 `eth0` 热插拔/重插恢复时自动重跑 `04` 挂载；LAN 在位时通过 `ensure_container_fw()` 自愈 `fw3` 的 `Allow-Host-UI` 与 `MASQUERADE`。
+- **5 秒快速看门狗 + 30 秒周期检查（每第 6 拍）**：
+  - 每 **5 秒**：容器异常立即重启 `04`；容器缺少 LAN 时执行 `ensure_usb_host_mode()`（纯墙充退避 5 分钟 = `60 × 5s`），一旦宿主枚举出 USB 网卡即调用 `attach_lan_inplace()` 原地热挂到运行中容器 netns（不重启 `procd`、不断 `10.200.1.2`，同步恢复 IPv4 / 原生 IPv6 `/64` / `table 200 via fe80::2 onlink` / `dnsmasq` / `odhcpd` / `fw3`；仅在失败时回退 `04` 重启）；
+  - 每 **30 秒（第 6 拍）**：`ensure_wan()` 重断言转发/路由/宿主 `iptables`；调用 `service_power_guard.sh` 保活电源守护；在 LAN 与 WAN-only 双模式下均调用 `ensure_container_fw()` 自愈 `fw3`。
 
 待复验：
 
@@ -486,11 +490,43 @@ hwclock: ioctl RTC_SET_TIME: Permission denied
 | IPv6 外网 | PC `ping -6 2400:3200::1`：**44–48 ms，0% 丢包** | ✅ |
 | 电源守护 | `cpu7=0`，`cap=59%`，`mmi_charging_enable=0`（Not charging） | ✅ |
 
+#### 8.2.6 CI Run #6 内核刷入与 `disable_warp_probe=Y` 上机验收（2026-11-27，PASSED）
+
+将 CI Run #6（build `45950059781`）编译的 `Image`（SHA256 `aa9bcca8f875851778b371b28ed4bac5f0f1ce94f0cee0ef201f33c3f97a8575`）与 Magisk 31.1 ramdisk 重新打包为 `artifacts/kernel_run6/new-boot-custom-v4-magisk31.1.img`（201,326,592 B，SHA256 `eadf3cf37bde2ea5402756eef01d68290be809d0d84bfd480a88fd22ed1b73d7`），刷入 `boot_a` 并完成清缓存回读 SHA256 校验后重启：
+
+| 验收项 | 实测结果 | 结论 |
+| :--- | :--- | :---: |
+| 内核版本与构建时间 | `5.4.254-qgki-gd2a1055adeb0`（`#1 SMP PREEMPT Fri Nov 27 06:15:42 UTC 2026`） | ✅ |
+| KABI 与模块加载 | CI 门禁 `1,607/1,607` 匹配；开机实载 **61** 个原厂模块（`lsmod` 62 行），`wlan` / `msm_drm` 正常 | ✅ |
+| WARP 探测禁用参数 | `/sys/module/oplus_chg/parameters/disable_warp_probe` = **`Y`**（权限 `0644`，运行时 `echo 0` 可逆） | ✅ |
+| `dmesg` 充电行为 | 开机充电期间捕获 **25 次** `disable_warp_probe,return`；**0 次** `switch1_gpio:1` / `warp mode` | ✅ |
+| 指纹与 Root | `fps_hal=running`，`/dev/goodix_fp` 存在，`HAL deaths: 0`；Magisk `31.1:MAGISK:R` | ✅ |
+| 有线 PC ADB 安全护栏 | 有线连接下 `a600000.ssusb/mode=peripheral`，`ensure_usb_host_mode()` 严格跳过未干扰 | ✅ |
+
+#### 8.2.7 5 秒看门狗、USB 3.0 5000 Mbps 与原地热挂基准实测（commit `6e3dc25`，PASSED）
+
+部署 commit `6e3dc25` 后（`service_openwrt_autorun.sh` 5s 快速看门狗 + 30s 周期任务 + `ensure_usb_host_mode()` A/B 极性缓存 + `attach_lan_inplace()` 原地热挂；`ensure_container_fw()` 覆盖 LAN 与 WAN-only 双模式），在带电非 PD 扩展坞（`power_role=[sink]` 充电激活状态）上模拟 USB 断连触发全自动恢复：
+
+| 阶段 / 指标 | 实测结果 | 结论 |
+| :--- | :--- | :---: |
+| USB 断连检测 | **3 秒**内被 5 秒看门狗捕获（`! container_has_lan`） | ✅ |
+| USB 3.0 SuperSpeed 恢复 | **5 秒**内通过缓存 `orientation=B`（`/data/openwrt/run/usb3_orient`）锁定 `usb 3-1` **5000 Mbps**，同时保持 `power_role=[sink]` 边充边用 | ✅ |
+| 原地热挂总耗时 | 总计 **11 秒**全链路恢复，容器 **`procd` PID 不变（`25000`）**，`10.200.1.2` 不中断 | ✅ |
+| 恢复后 PC IPv4 | `ping 223.5.5.5`：**58 ms，0% 丢包** | ✅ |
+| 恢复后 PC 原生 IPv6 | `ping -6 2400:3200::1`：**46–47 ms，0% 丢包**（`table 200 via fe80::2 onlink` 已自动重建） | ✅ |
+| 纯墙充保护 | 未检测到 USB 网卡时自动恢复 `mode=none` / `orientation=none` 并退避 **5 分钟（`60 × 5s`）** | ✅ |
+
+#### 8.2.8 生产环境 USB 3.0（5000 Mbps）核验标准与防误判指南
+
+- **权威判定**：检查 `/sys/bus/usb/devices/3-[1-9]*/speed` = **`5000`**（Mbps，bus `usb3`）且 `version` = `3.00` / `3.20`（降级为 USB 2.0 时会挂在 `2-1`，`speed` = **`480`**），同时核对 `a600000.ssusb/orientation`（`A`/`B`）与 `disable_warp_probe=Y`。
+- **禁止误判**：`a600000.ssusb/speed`（始终报控制器最大能力 `super-speed`）与 `eth0` RJ45 协商速率（`1000` / `2500` Mbps）**均不能证明 USB 侧已协商 USB 3.0**。
+- 一行核验命令见第 11 节。
+
 ---
 
 ## 9. 仓库与发布卫生
 
-- 117 个分区全量备份 14.29 GiB，SHA256 校验通过；
+- 117 个分区全量备份 14.29 GiB（SHA256 校验通过）与初始原厂 Root boot 由用户在工作区外独立保管；工作区旧备份 `.img` 及历史废旧预 CI 脚本已清理；
 - 仓库无 token / 私钥 / 设备序列号；
 - 文档中的真实 IPv6 前缀、EUI-64、内网 IP、Windows 用户名已从历史清除；
 - 历史压缩为单初始提交 + 后续修复提交；
@@ -502,23 +538,27 @@ hwclock: ioctl RTC_SET_TIME: Permission denied
 
 ## 10. 未完成 / 可选项
 
-1. **2.5G 网卡（RTL8156B/BG）冷启动复验与 24–72 小时耐力测试**（千兆 RTL8153 免手操冷启动已于 2026-11-27 通过）；
-2. **刷入含 `fix_oplus_warp_probe.patch` 的新版内核并实测验证**（确认 `disable_warp_probe=Y` 且充电时零 `switch1_gpio:1`）；
-3. 23.05.5 `armsr/armv8` rootfs + 禁用 `fw4` 的旁路测试；
-4. 容器内 AdGuard Home / Clash（仅服务 USB LAN 客户端）；
-5. USB WiFi 网卡 + 内核内置驱动（让 OpenWrt 自己发 WiFi）；
-6. Android OTA 后的 KABI 复验流程自动化。
+1. **2.5G 网卡（RTL8156B/BG）冷启动复验与 24–72 小时耐力测试**（千兆 RTL8153 免手操冷启动、Run #6 WARP 补丁与 11 秒原地热挂均已于 2026-11-27 通过）；
+2. 23.05.5 `armsr/armv8` rootfs + 禁用 `fw4` 的旁路测试；
+3. 容器内 AdGuard Home / Clash（仅服务 USB LAN 客户端）；
+4. USB WiFi 网卡 + 内核内置驱动（让 OpenWrt 自己发 WiFi）；
+5. Android OTA 后的 KABI 复验流程自动化。
 
 ---
 
 ## 11. 复现命令
 
 ```bash
-# 内核与 KABI / WARP 开关
-adb shell uname -r
+# 内核、模块与 WARP 开关（Run #6）
+adb shell uname -a
+adb shell su -c "lsmod | wc -l"
 adb shell su -c "grep -c 'rtl8152' /proc/kallsyms"
 adb shell su -c "/data/adb/magisk/busybox unshare -p -f sh -c 'echo pid=\$\$'"
 adb shell su -c "cat /sys/module/oplus_chg/parameters/disable_warp_probe"
+adb shell su -c "dmesg | grep -E 'disable_warp_probe|switch1_gpio:1|warp mode' | tail -20"
+
+# 生产环境 USB 3.0（5000 Mbps）权威一行核验（bus 3 = USB 3.0 5000Mbps；bus 2 = USB 2.0 480Mbps）
+adb shell su -c 'for d in /sys/bus/usb/devices/[23]-[1-9]*; do [ -f "$d/idVendor" ] && echo "$(basename $d) $(cat $d/idVendor):$(cat $d/idProduct) speed=$(cat $d/speed)Mbps usb=$(cat $d/version | tr -d " ") $(cat $d/product 2>/dev/null)"; done; echo "mode=$(cat /sys/devices/platform/soc/a600000.ssusb/mode) orient=$(cat /sys/devices/platform/soc/a600000.ssusb/orientation) warp_dis=$(cat /sys/module/oplus_chg/parameters/disable_warp_probe) power=$(cat /sys/class/typec/port0/power_role)"'
 
 # 容器与防泄漏检查
 adb shell su -c "cat /data/openwrt/run/container.pid"
@@ -531,7 +571,7 @@ adb shell su -c "/data/adb/magisk/busybox wget -O - http://10.200.1.2/ | head"
 adb shell su -c "P=\$(cat /data/openwrt/run/container.pid); /data/adb/magisk/busybox nsenter -t \$P -m -u -n -p -- /system/bin/chroot /data/openwrt/rootfs /bin/sh -c 'export PATH=/usr/sbin:/usr/bin:/sbin:/bin; iptables -t nat -S zone_wan_postrouting; iptables -S zone_wan_input'"
 
 # USB Host 与电源
-adb shell su -c "cat /sys/devices/platform/soc/a600000.ssusb/mode /sys/class/typec/port0/data_role /sys/class/typec/port0/power_role"
+adb shell su -c "cat /sys/devices/platform/soc/a600000.ssusb/mode /sys/devices/platform/soc/a600000.ssusb/orientation /sys/class/typec/port0/data_role /sys/class/typec/port0/power_role"
 adb shell su -c "cat /sys/devices/system/cpu/cpu7/online"
 adb shell su -c "cat /sys/class/oplus_chg/battery/capacity"
 adb shell su -c "cat /sys/class/oplus_chg/battery/mmi_charging_enable"

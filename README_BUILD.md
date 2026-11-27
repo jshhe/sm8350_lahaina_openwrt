@@ -3,11 +3,12 @@
 本文档记录当前固件的完整落地流程：**自定义 KABI 安全内核 → 刷入 boot → 部署 OpenWrt 21.02.7 容器 → 网络/自启 → 验证**。
 
 > **当前基线（2026-11-27）**
-> - Android：OOS 14 `LE2120_14.0.0.1901`，Magisk 31.1
-> - 内核：`5.4.254-qgki-gd2a1055adeb0`，GitHub Actions build `45950059781`（run6），已合入 0-KABI 补丁 `fix_oplus_warp_probe.patch`（`/sys/module/oplus_chg/parameters/disable_warp_probe=Y`）
-> - KABI：1,607 / 1,607 符号 CRC 匹配
+> - Android：OOS 14 `LE2120_14.0.0.1901`，Magisk 31.1（`31.1:MAGISK:R`）
+> - 内核：`5.4.254-qgki-gd2a1055adeb0`（`#1 SMP PREEMPT Fri Nov 27 06:15:42 UTC 2026`），GitHub Actions build `45950059781`（run6），已合入 0-KABI 补丁 `fix_oplus_warp_probe.patch`（`/sys/module/oplus_chg/parameters/disable_warp_probe=Y`，`0644`，实测 25 次拦截、0 次 `switch1_gpio:1`）
+> - KABI：1,607 / 1,607 符号 CRC 匹配（开机实载 61 个原厂模块，`fps_hal=running`）
 > - OpenWrt：21.02.7 `armvirt/64`（`fw3` + `iptables-legacy`）
-> - 当前 boot：`artifacts/kernel_run6/new-boot-custom-v4-magisk31.1.img`（SHA256 `eadf3cf3…ed1b73d7`）
+> - `Image`：48,421,376 字节，SHA256 `aa9bcca8f875851778b371b28ed4bac5f0f1ce94f0cee0ef201f33c3f97a8575`
+> - 当前 boot：`artifacts/kernel_run6/new-boot-custom-v4-magisk31.1.img`（201,326,592 字节，SHA256 `eadf3cf37bde2ea5402756eef01d68290be809d0d84bfd480a88fd22ed1b73d7`）
 >
 > 旧的“原厂内核 + r8152 Magisk 模块”路线仅作为**零刷机兜底/回滚参考**，不再是主路线。
 
@@ -18,11 +19,11 @@
 | 产物 | 说明 |
 | :--- | :--- |
 | `AnyKernel3-OnePlus9Pro-OpenWrt-5.4.zip` | 给 Kernel Flasher 用；保留当前 boot 的 ramdisk（含 Magisk） |
-| `Image` | 裸内核，48,421,376 字节；**不能直接 fastboot 刷** |
+| `Image` | 裸内核，48,421,376 字节（SHA256 `aa9bcca8…97a8575`）；**不能直接 fastboot 刷** |
 | `Module.symvers` | 本次构建的导出符号 CRC，用于 KABI 审计与新固件对比 |
-| `new-boot-custom-v3.img` | 已打包好的完整 boot（Magisk ramdisk + 自定义内核），可直接刷 `boot_a` |
-| `r8152_2p5g.ko` | 原厂内核兜底模块（当前已不使用） |
-| `r8152-2.5G-Magisk-Module.zip` | 原厂内核 + Magisk 的免刷机方案（备用） |
+| `artifacts/kernel_run6/new-boot-custom-v4-magisk31.1.img` | 本地打包好的完整 boot（Magisk 31.1 ramdisk + Run #6 内核，201,326,592 字节），可直接刷 `boot_a` |
+| `r8152_2p5g.ko` | 原厂内核兜底模块（由 `build_kernel.yml` 同步产出，当前已不使用） |
+| `r8152-2.5G-Magisk-Module.zip` | 原厂内核 + Magisk 的免刷机方案（由 `build_kernel.yml` 同步产出，备用） |
 | `stock-config-used.txt` | 本次实际使用的内核配置 |
 
 关键事实：
@@ -121,7 +122,7 @@ GitHub Actions → **Build OnePlus 9 Pro 5.4 Kernel (OpenWrt + RTL8156B)** → *
 
 1. 下载 Clang `r383902b1` + GCC 4.9 工具链；
 2. 克隆 OnePlusOSS 内核与 `modules_and_devicetree`，覆盖 `vendor` / `techpack` / `device`；
-3. 应用 `fix_oplus_warp_probe.patch`（0-KABI WARP 探测开关）并用 `drivers/r8152/` 替换内核里的旧 `r8152.c`；
+3. 用 `drivers/r8152/` 替换内核里的旧 `r8152.c`，随后通过 `git apply --check -p1` / `git apply -p1` 应用 `fix_oplus_warp_probe.patch`（0-KABI WARP 探测开关）并校验 `disable_warp_probe` 落位；
 4. 以 `configs/stock_le2120_1901.config` 为基线，打开第 2 节的选项；
 5. 强制检查关键 `CONFIG_*`，缺一个就失败；
 6. 编译 `Image`；
@@ -177,8 +178,16 @@ $fb = ".tmp\platform-tools-34\platform-tools\fastboot.exe"
 ### 4.3 刷完验证
 
 ```bash
-adb shell uname -r
-# 期望：5.4.254-qgki-gd2a1055adeb0
+adb shell uname -a
+# 期望：Linux localhost 5.4.254-qgki-gd2a1055adeb0 #1 SMP PREEMPT Fri Nov 27 06:15:42 UTC 2026 aarch64 Toybox
+
+adb shell su -c "cat /sys/module/oplus_chg/parameters/disable_warp_probe"
+# 期望：Y（权限 0644；如需直插原装快充头临时恢复，可执行 echo 0 > ...）
+adb shell su -c "dmesg | grep -E 'disable_warp_probe|switch1_gpio:1|warp mode'"
+# 期望：仅有 disable_warp_probe,return，零 switch1_gpio:1 / warp mode
+
+adb shell su -c "lsmod | wc -l"
+# 期望：62（61 个已加载原厂模块 + 表头）
 
 adb shell su -c "dmesg | grep -i r8152"
 adb shell su -c "grep r8152 /proc/kallsyms | head"
@@ -190,6 +199,8 @@ adb shell su -c "/data/adb/magisk/busybox unshare -p -f sh -c 'echo pid_inside_n
 # 期望：pid_inside_ns=1
 
 # 指纹
+adb shell getprop init.svc.fps_hal
+# 期望：running
 adb shell dumpsys fingerprint | head -20
 adb shell ls -l /dev/goodix_fp
 ```
@@ -206,7 +217,7 @@ Realtek RTL8152/RTL8153 Based USB Ethernet Adapters v2.22.1
 
 如果只想零刷机验证，可用原厂内核 + `r8152-2.5G-Magisk-Module.zip`：
 
-1. GitHub Actions → **Build r8152 2.5G Module for Stock Kernel**；
+1. GitHub Actions → **Build OnePlus 9 Pro 5.4 Kernel (OpenWrt + RTL8156B)**（`.github/workflows/build_kernel.yml` 会同步产出 `r8152_2p5g.ko` 与 `r8152-2.5G-Magisk-Module.zip`）；
 2. 下载 zip → Magisk App → 模块 → 从本地安装；
 3. 重启，检查 `lsmod | grep r8152`。
 
@@ -331,7 +342,7 @@ default via <5G网关> dev <rmnet>        # 5G 默认
 - `04` 用目录锁串行化，autorun 与手动执行不会并发创建 veth；
 - 严格用 `pgrep -P "$UNSHARE_PID"`（回退 `ps -A -o PID,PPID`）定位新容器 init PID，绝不回退匹配任意 rootfs 进程；
 - veth 用 toybox `ip link add name ... peer name ...`，并校验 peer 存在；
-- `ensure_usb_host_mode()` 严守 `mode=peripheral` 不碰 PC 数据线，仅在检测到带电 Type-C Host 扩展坞被 OPLUS 打回 `mode=none` 或 `mode=host` 无设备时暂关 `mmi_charging_enable` 恢复 Host 枚举；
+- `ensure_usb_host_mode()` 严守 `mode=peripheral` 不碰 PC 数据线，支持 `data_role=[host]` 及带电非 PD 扩展坞热插（`mode=none` + `data_role=[device]` + `USB_DCP`）；在 `mode=none` 或 `mode=host` 且无 xHCI 设备时，按缓存 `/data/openwrt/run/usb3_orient` 优先探测 `/sys/devices/platform/soc/a600000.ssusb/orientation`（`A`/`B`），锁定 **USB 3.0 SuperSpeed 5000 Mbps（`usb 3-1`）** 边充边用（Run #6 `disable_warp_probe=Y` 时无需暂关 `mmi_charging_enable`，仅在旧内核回退时暂关；纯墙充无网卡时恢复 `mode=none` 并在看门狗里退避 5 分钟 = `60 × 5s`）；
 - 容器 init 与 reload 全部完成后把 `/dev/rtc0` / `/dev/rtc` 覆盖成 `/dev/null`；
 - 5G PDN 抖动时 `04` 重试 30 秒；autorun 等待 180 秒；
 - 找 5G 接口用 `ip -4 route show table all`，不依赖 Wi-Fi 可能占据的系统默认路由。
@@ -361,12 +372,15 @@ exec /system/bin/sh /data/openwrt/scripts/service_openwrt_autorun.sh
 3. 通过 `find_rmnet_wan()` 等 5G 活跃路由（最多 180 秒）；
 4. 调用 `ensure_usb_host_mode()` 并等 USB 网卡（`eth0`/`usb0`/`eth1`，最多 30 秒）；
 5. 容器没跑就以 `/system/bin/sh` 执行 `04`；
-6. 每 30 秒看门狗：
-   - `ensure_wan()`：重断言 `ip_forward` / IPv6 forwarding、table 100、rule 90/100/101，以及宿主 `iptables` `MASQUERADE` / `FORWARD` 规则；
-   - 电源守护挂了自动拉起；
-   - 容器挂了自动重启；
-   - 若容器处于 WAN-only（`! container_has_lan`），调用 `ensure_usb_host_mode()` 恢复 USB Host，检测到 `host_has_lan` 时自动重跑 `04` 挂载热插拔/重插供电后的网卡；
-   - 容器与 LAN 正常时调用 `ensure_container_fw()` 检查 `zone_wan_postrouting`（`MASQUERADE`）与 `zone_wan_input`，缺失时自动重启容器 `firewall` 自愈。
+6. **快速 5 秒看门狗 + 30 秒周期检查（每第 6 拍）**：
+   - 每 **5 秒**：
+     - 检查容器存活，挂了立即重跑 `04`；
+     - 若容器缺少 LAN（`! container_has_lan`），调用 `ensure_usb_host_mode()`（支持 `data_role=[host]` 与 `USB_DCP` 非 PD 坞热插，探测并缓存 `orientation` A/B 至 `/data/openwrt/run/usb3_orient` 锁定 USB 3.0 5000 Mbps；纯墙充退避 5 分钟 = `60 × 5s`）；
+     - 检测到宿主出现 USB 网卡（`host_has_lan`）时，优先调用 **`attach_lan_inplace()` 原地热挂**：直接把网卡移入运行中容器 netns（不重启 `procd`、不断 `10.200.1.2`），配置 `eth0` IPv4 + 重配运营商原生 IPv6 `/64` + 宿主 `table 200`（`via fe80::2 onlink`）+ 重启 `dnsmasq`/`odhcpd` + 校验 `fw3`，实测断连至恢复仅 **11 秒**；仅在原地热挂失败时回退完整 `04` 重启；
+   - 每 **30 秒（第 6 拍）**：
+     - `ensure_wan()`：重断言 `ip_forward` / IPv6 forwarding、table 100、rule 90/100/101，以及宿主 `iptables` `MASQUERADE` / `FORWARD` 规则；
+     - 调用 `service_power_guard.sh` 保活电源守护；
+     - 调用 `ensure_container_fw()` 校验并自愈容器 `fw3`（`zone_wan_postrouting` `MASQUERADE` 与 `zone_wan_input`），**LAN 与 WAN-only 双模式均执行**。
 
 临时禁用自启（不删入口）：
 
@@ -432,6 +446,24 @@ $BB nsenter -t "$P" -m -u -n -p -- /system/bin/chroot /data/openwrt/rootfs /bin/
 
 应返回 200 和跳转到 `cgi-bin/luci/` 的页面。
 
+### 7.4 生产环境 USB 3.0（5000 Mbps）验证指南
+
+判断 USB 网卡是否真正以 **USB 3.0 SuperSpeed（5000 Mbps）** 协商的**权威检查项**：
+
+1. `/sys/bus/usb/devices/3-[1-9]*/speed` = **`5000`**（Mbps，挂在 `usb3` 总线）且 `version` = `3.00` / `3.20`；若被降级到 USB 2.0，设备会出现在 `2-1`，`speed` = **`480`**；
+2. `/sys/devices/platform/soc/a600000.ssusb/orientation` 为 `A` 或 `B`（与 `/data/openwrt/run/usb3_orient` 缓存一致）；
+3. `/sys/module/oplus_chg/parameters/disable_warp_probe` = **`Y`**，且充电时 `power_role` 包含 `[sink]`。
+
+> **不要用以下两个指标误判 USB 3.0**：
+> - `/sys/devices/platform/soc/a600000.ssusb/speed` 输出 `super-speed` 只代表控制器**最大硬件能力**，即使外设掉到 USB 2.0 它也依然显示 `super-speed`；
+> - `eth0` 的 RJ45 链路速率（`1000` / `2500` Mbps）只代表网线/交换机侧协商速率，**不能证明 USB 总线跑在 5000 Mbps**。
+
+一行核验命令：
+
+```bash
+adb shell su -c 'for d in /sys/bus/usb/devices/[23]-[1-9]*; do [ -f "$d/idVendor" ] && echo "$(basename $d) $(cat $d/idVendor):$(cat $d/idProduct) speed=$(cat $d/speed)Mbps usb=$(cat $d/version | tr -d " ") $(cat $d/product 2>/dev/null)"; done; echo "mode=$(cat /sys/devices/platform/soc/a600000.ssusb/mode) orient=$(cat /sys/devices/platform/soc/a600000.ssusb/orientation) warp_dis=$(cat /sys/module/oplus_chg/parameters/disable_warp_probe) power=$(cat /sys/class/typec/port0/power_role)"'
+```
+
 ---
 
 ## 8. 实测缺陷与修复
@@ -459,8 +491,9 @@ $BB nsenter -t "$P" -m -u -n -p -- /system/bin/chroot /data/openwrt/rootfs /bin/
 | 容器内 `date` 与宿主不一致 | 容器曾执行 `hwclock -s` / NTP | 容器禁用时间服务并隐藏 RTC；Android `auto_time=1`、`ntp_server=ntp.aliyun.com` |
 | Magisk `service.d` 下 `veth-owrt` 反复创建失败且每 30 秒泄漏容器 | Magisk 在 BusyBox ash `ASH_STANDALONE=1` 模式运行脚本（忽略 `PATH`），BusyBox `ip` 建不出命名 peer、BusyBox `ps` 无 `-A -o` | `00_openwrt.sh`、`service_openwrt_autorun.sh`、`04` 三层 `unset ASH_STANDALONE` + `exec /system/bin/sh`，并改用 `pgrep -P` 严格匹配容器 init PID |
 | PC 原生 IPv6 ping 外网 100% 丢包 | 宿主 `table 200` 原为 `<prefix>/64 dev veth-host`，Android 在 `veth-host` 上对 LAN 客户端发 NDP 解析失败 | 改为 `via fe80::2 dev veth-host onlink table 200`；PC ping `2400:3200::1` 34–53 ms、0% 丢包 |
-| 容器冷启动后 `fw3` 规则为空（手机打不开 LuCI 或 LAN 无 NAT） | `04` 启动时与 `procd`/`S19firewall` 及异步 `netifd reload` 竞态 | 将 `/etc/init.d/firewall restart` 移至 `04` 末尾并校验重试；30 秒看门狗增加 `ensure_container_fw()` 自动自愈 |
-| 带电扩展坞重插/充电时 USB 网卡掉线或 `error -71` | VBUS 触发 `oplus_otg_disable_work` 将 dwc3 打回 `mode=none`；充电时 OPLUS `oplus_chg_fast_switch_check()` 翻转 `switch1_gpio:1`（WARP）抢占 D+/D- | 用户态新增 `ensure_usb_host_mode()`（严守 `mode=peripheral`）+ 热挂看门狗（30–60 秒自愈）；内核新增 0-KABI 补丁 `fix_oplus_warp_probe.patch`（`disable_warp_probe=1`） |
+| 容器冷启动后 `fw3` 规则为空（手机打不开 LuCI 或 LAN 无 NAT） | `04` 启动时与 `procd`/`S19firewall` 及异步 `netifd reload` 竞态 | 将 `/etc/init.d/firewall restart` 移至 `04` 末尾并校验重试；看门狗每 30 秒（5s 循环第 6 拍）在 LAN 与 WAN-only 双模式下执行 `ensure_container_fw()` 自愈 |
+| 带电扩展坞重插/充电时 USB 网卡掉线或 `error -71` | VBUS 触发 `oplus_otg_disable_work` 将 dwc3 打回 `mode=none`；充电时 OPLUS `oplus_chg_fast_switch_check()` 翻转 `switch1_gpio:1`（WARP）抢占 D+/D- | Run #6 合入 0-KABI 补丁 `fix_oplus_warp_probe.patch`（`disable_warp_probe=Y`，实测 25 次拦截/0 次 `switch1_gpio:1`）；用户态升级为 5 秒看门狗 + `ensure_usb_host_mode()`（严守 `mode=peripheral`）+ `attach_lan_inplace()` 原地热挂（11s 自愈、不重启 `procd`） |
+| 恢复 USB Host 后网卡降级为 USB 2.0（480 Mbps） | 强写 `mode=host` 缺少 Type-C 极性事件，`ss_phy` 未设置 `PHY_LANE_A/B` | `ensure_usb_host_mode()` 探测 `a600000.ssusb/orientation`（`A`/`B`）并缓存至 `/data/openwrt/run/usb3_orient`，锁定 `usb 3-1` **5000 Mbps** 边充边用 |
 
 更完整的测试记录见 **[`TEST_REPORT.md`](TEST_REPORT.md)**。
 
@@ -468,11 +501,12 @@ $BB nsenter -t "$P" -m -u -n -p -- /system/bin/chroot /data/openwrt/rootfs /bin/
 
 ## 9. 回滚
 
-详见 **[`RECOVERY_AND_ROLLBACK.md`](RECOVERY_AND_ROLLBACK.md)**。最快路径：
+详见 **[`RECOVERY_AND_ROLLBACK.md`](RECOVERY_AND_ROLLBACK.md)**。工作区不再留存旧备份 `.img`（由用户在工作区外自行保管初始 Root boot 与 117 分区备份），最快回滚路径：
 
 ```powershell
 $fb = ".tmp\platform-tools-34\platform-tools\fastboot.exe"
-& $fb flash boot_a magisk_patch\magisk_patched_boot_v30.7.img
+$backup = "<你的外部备份路径>"
+& $fb flash boot_a "$backup\stock_magisk_boot.img"
 & $fb reboot
 ```
 
