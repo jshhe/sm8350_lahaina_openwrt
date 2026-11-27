@@ -1,8 +1,8 @@
 # 总计划与执行记录（As-Built）
 
 > 项目：一加 9 Pro（SM8350 / lemonadep / LE2120）→ Android + OpenWrt 5G CPE
-> 状态：**主链路已完成并验证**，剩余插网卡冷启动验收与可选项。
-> 最后更新：2026-11
+> 状态：**主链路及千兆 USB 网卡免手操冷启动验收已通过**；剩余 2.5G 网卡冷启动复验、24–72 小时耐力测试及可选项。
+> 最后更新：2026-11-27
 
 ---
 
@@ -78,11 +78,14 @@
 | 19 | 原生 IPv6 `/64` | ✅ | PC 可 ping 容器与外网 |
 | 20 | LuCI 中文 | ✅ | `lang="zh-cn"`，标题“概览” |
 | 21 | 电源/充电守护 | ✅ | cpu7=0，60% 停充 |
-| 22 | 开机自启 / 看门狗 | ⚠️ | WAN-only 已验证；插网卡冷启动待验收 |
-| 23 | 目录统一 `/data/openwrt` | ✅ | 唯一入口 `service.d/00_openwrt.sh` |
+| 22 | 开机自启 / 看门狗 | ✅ | 2026-11-27 千兆 RTL8153 免手操冷启动 + 供电重插自愈通过；2.5G 待复验 |
+| 23 | 目录统一 `/data/openwrt` | ✅ | 唯一入口 `service.d/00_openwrt.sh`（清 `ASH_STANDALONE`） |
 | 24 | 仓库审计 / 历史压缩 | ✅ | 无密钥/序列号，GPL-2.0 + NOTICE |
 | 25 | 容器时钟/RTC 隔离 | ✅ | 禁用 sysfixtime/sysntpd，RTC 覆盖为 null |
 | 26 | 容器泄漏清理 / 04 加锁 | ✅ | 2002 进程/196 netns → 1 容器 |
+| 27 | Magisk `ASH_STANDALONE` 与 `fw3` 竞态修复 | ✅ | 三层清 `ASH_STANDALONE` + `pgrep -P`；`04` 末尾重启 `fw3` + 看门狗 `ensure_container_fw` |
+| 28 | 原生 IPv6 `table 200` 下一跳修复 | ✅ | `via fe80::2 dev veth-host onlink`，PC ping `2400:3200::1` 0% 丢包 |
+| 29 | 带电扩展坞 Host 自愈 + WARP 0-KABI 补丁 | ✅ | `ensure_usb_host_mode` 实测重插自愈 + 边充边用；`fix_oplus_warp_probe.patch` 已加入内核构建 |
 
 ---
 
@@ -155,6 +158,12 @@
 - Android `auto_time=1` + `ntp_server=ntp.aliyun.com` 负责校时；
 - 详见 [`TIME_NOTES.md`](TIME_NOTES.md)。
 
+### D10：隔离 Magisk `ASH_STANDALONE` 并关闭 OPLUS WARP D+/D- 探测
+
+- Magisk 默认以 BusyBox ash 独立模式（`ASH_STANDALONE=1`）运行 `service.d`，会忽略 `PATH` 并用 BusyBox `ip`/`ps` 替换 toybox，导致 `veth-owrt` 创建失败和每 30 秒泄漏容器；因此在 `00_openwrt.sh`、`service_openwrt_autorun.sh`、`04` 三层清除 `ASH_STANDALONE` 并重执 `/system/bin/sh`；
+- 带电 Type-C 扩展坞充电时，OPLUS `oplus_chg_fast_switch_check()` 看到 `USB_DCP` 会翻转硬件 D+/D- 开关 `switch1_gpio:1`（WARP 探测），导致 USB 网卡 `error -71` 掉线；
+- 解决策略双管齐下：用户态在 `autorun` 与 `04` 加入 `ensure_usb_host_mode()`（严守 `mode=peripheral` 不碰 PC 数据线）+ 热挂看门狗；内核侧新增 0-KABI 补丁 `fix_oplus_warp_probe.patch`，通过 `/sys/module/oplus_chg/parameters/disable_warp_probe`（默认 `1`，运行时 `echo 0` 可逆）关闭 WARP 探测同时保留普通 5V/PD 充电。
+
 ---
 
 ## 4. 硬件与外设
@@ -162,12 +171,12 @@
 | 设备 | 要求 | 当前状态 |
 | :--- | :--- | :--- |
 | 手机 | 一加 9 Pro LE2120，OOS 14 | ✅ |
-| USB-C 扩展坞 | PD 供电 + USB 3.0 | 用户自备 |
-| USB 2.5G 网卡 | RTL8156B / RTL8156BG | 已验证 |
-| 充电头 | 30–65W PD | 用户自备 |
+| USB-C 扩展坞 | 标准 **USB-PD（支持 `PR_SWAP`）** + USB 3.0 | 强烈推荐 PD 坞；非 PD 5V 坞已实测定位限制 |
+| USB 网卡 | RTL8156B/BG（2.5G）或 RTL8153（1G） | 1G（`0bda:8153`，5 Gbps）冷启动已验收；2.5G 热插拔已验证、冷启动待复验 |
+| 充电头 | 30–65W 标准 PD | 用户自备 |
 | 散热 | 可选 | 建议长期运行加 |
 
-> 避免使用非标准 VOOC/WARP 直充头；用通用 PD 让扩展坞握手。
+> 避免使用非标准 VOOC/WARP 直充头；也避免非 PD 5V 扩展坞（实测 `power_operation_mode=default` / `[BrickID]` 重启后不会自动发送 `PR_SWAP`，需重插才从 `power_role=[source]` 切回 `[sink]` 充电）。使用标准 USB-PD 扩展坞可稳定握手。
 
 ---
 
@@ -179,14 +188,15 @@
 | `scripts/01b_full_backup_all_partitions.sh` | 117 分区全量备份 |
 | `scripts/02_patch_kernel_config.py` | 内核配置合入 |
 | `scripts/03_setup_openwrt_rootfs.sh` | 解压/适配 rootfs |
-| `scripts/04_start_openwrt_and_network.sh` | 启动容器、netns 直通、veth、NAT、IPv6 |
+| `scripts/04_start_openwrt_and_network.sh` | 启动容器、USB Host 恢复、netns 直通、veth、NAT、IPv6、`fw3` 重启 |
 | `scripts/05b_cpu_charge_guard.sh` | cpu7 离线、限频、50–60% 停充 |
 | `scripts/05_headless_power_control.sh` | 可选无头化节能 |
 | `scripts/06_android_functional_test.sh` | Android 功能/命名空间测试 |
 | `scripts/06_restore_gui.sh` | 恢复图形界面 |
 | `scripts/verify_kabi_crc.py` | 1,607 符号 CRC 闸门 |
-| `service_openwrt_autorun.sh` | 开机自启 + 看门狗 |
+| `service_openwrt_autorun.sh` | 开机自启 + 30 秒看门狗（WAN / USB Host 热挂 / `fw3` 自愈 / 电源守护） |
 | `service_power_guard.sh` | 电源守护拉起/防重复 |
+| `fix_oplus_warp_probe.patch` | 0-KABI 内核补丁：默认跳过 OPLUS WARP D+/D- 探测（`disable_warp_probe=1`） |
 
 ---
 
@@ -199,16 +209,18 @@
 - [x] 99 个原厂模块全部加载
 - [x] 指纹 / 显示 / 音频 / 相机 / WiFi / 5G 正常
 - [x] `unshare -p -f` 内 PID=1
-- [x] 容器 `procd` / `dnsmasq` / `dropbear` / `odhcpd` 运行
+- [x] 容器 `procd` / `dnsmasq` / `dropbear` / `odhcpd` / `fw3` 运行（单 `procd`，0 泄漏）
 - [x] PC 通过 USB 网卡获得 `192.168.2.x`
-- [x] LuCI 中文可访问
-- [x] IPv4 出口正常
-- [x] IPv6 原生 `/64` 正常
+- [x] LuCI 中文可访问（PC `http://192.168.2.1/` 与手机浏览器 `http://10.200.1.2/`）
+- [x] IPv4 出口正常（`223.5.5.5` 0% 丢包）
+- [x] IPv6 原生 `/64` 正常（`table 200` `via fe80::2 onlink`，`2400:3200::1` 0% 丢包）
 - [x] cpu7 离线，60% 停充
+- [x] 拔 USB 数据线、插千兆网卡（RTL8153 `0bda:8153`，USB 3.0 5 Gbps）、重启手机，免手操全自动恢复 LAN + WAN（2026-11-27 通过）
+- [x] 带电扩展坞供电重插后 USB Host 自动恢复（~30–60 秒）并验证边充边用
 
 ### 待通过
 
-- [ ] 拔 USB 数据线、插 2.5G 网卡、重启手机，全自动恢复 LAN + WAN
+- [ ] 插 2.5G 网卡（RTL8156B/BG）冷启动免手操复验
 - [ ] 连续运行 24–72 小时无断流/内存泄漏
 - [ ] 5G 重拨后 IPv6 前缀自动刷新（当前需重跑 `04`）
 
@@ -218,8 +230,8 @@
 
 | 优先级 | 事项 | 说明 |
 | :---: | :--- | :--- |
-| P0 | 插网卡冷启动验收 | 当前最大未验证项 |
-| P1 | 5G 重拨 / 网卡热插拔自动化 | 目前靠 30 秒看门狗与人工重跑 |
+| P0 | 2.5G 网卡冷启动复验与 24–72h 耐力测试 | 千兆（RTL8153）免手操冷启动已于 2026-11-27 通过；2.5G（RTL8156B/BG）冷启动与长稳测试待验收 |
+| P1 | 5G 重拨 IPv6 前缀自动刷新 | USB 网卡热插拔/供电重插自愈已由 30 秒看门狗实现；5G 重拨换前缀刷新待自动化 |
 | P2 | 23.05.5 + 禁用 fw4 旁路测试 | 不重编内核 |
 | P3 | AG / Clash 部署 | 仅服务 USB LAN |
 | P4 | USB WiFi 网卡 + 内置驱动 | 需要重编内核 |

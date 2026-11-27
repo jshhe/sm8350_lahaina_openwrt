@@ -10,7 +10,8 @@
 - **IPv6**：运营商 `/64` 原生共享，**不做 NAT66**。
 
 > **项目状态：可用，持续验证中。**
-> 最后一次上机验证：2026-11-03。Android 关键功能、内核、容器、IPv4/IPv6、LuCI 中文、时间/RTC 隔离均已通过。
+> 最后一次上机验证：2026-11-27。Android 关键功能、内核、容器、IPv4/原生 IPv6、LuCI 中文、时间/RTC 隔离、带电扩展坞供电重插自愈以及**千兆 USB 网卡（RTL8153）免手操冷启动验收**均已通过。
+> 尚未完成：2.5G 网卡（RTL8156B/BG）冷启动复验、24–72 小时耐力测试，以及合入 `fix_oplus_warp_probe.patch` 新内核后的上机复验。
 
 ---
 
@@ -78,14 +79,16 @@ Android 宿主 + namespace/chroot 容器 + USB 网卡 netns 直通 + 5G 宿主 N
 | 音频 / 相机 / 内部 WiFi | ✅ | 均保持 Android 原生功能 |
 | USB 2.5G 网卡 | ✅ | `r8152 v2.22.1` 已内置内核，Magisk 模块已移除 |
 | `PID_NS` | ✅ | `unshare -p -f` 内 PID=1，`procd` 不会误杀 Android |
-| OpenWrt 服务 | ✅ | `procd` / `ubusd` / `uhttpd` / `dropbear` / `dnsmasq` / `odhcpd` |
-| LAN DHCP | ✅ | PC 曾获得 `192.168.2.227` |
-| LuCI | ✅ | 中文界面，`http://192.168.2.1/` 与 `http://10.200.1.2/` 均可访问 |
-| IPv4 NAT | ✅ | LAN → veth → 宿主 MASQUERADE → 5G |
-| 原生 IPv6 | ✅ | PC 获得运营商 `/64` 地址，可 ping 容器 `::1` 与外网 |
+| OpenWrt 服务 | ✅ | `procd` / `ubusd` / `uhttpd` / `dropbear` / `dnsmasq` / `odhcpd` / `fw3` |
+| LAN DHCP | ✅ | PC 自动获得 `192.168.2.227/24` |
+| LuCI | ✅ | 中文界面，PC `http://192.168.2.1/` 与手机浏览器 `http://10.200.1.2/` 均可访问 |
+| 容器防火墙 (`fw3`) | ✅ | `04` 末尾重启 + 30 秒看门狗自愈，`zone_wan_input`（`Allow-Host-UI`）与 `MASQUERADE` 生效 |
+| IPv4 NAT | ✅ | LAN → veth → 宿主 MASQUERADE → 5G，PC ping `223.5.5.5` 0% 丢包 |
+| 原生 IPv6 | ✅ | PC 自动获得运营商 `/64`，宿主 `table 200` 经 `via fe80::2 onlink` 转发，ping `2400:3200::1` 0% 丢包 |
 | 电源守护 | ✅ | `cpu7=0`、A55 1.32GHz、A78 1.44GHz、60% 停充 / 50% 恢复 |
 | 宿主时间 | ✅ | 容器不再读写 RTC；重启后由 Android NTP 校正 |
-| 开机自启 | ⚠️ | WAN-only 路径已验证；插网卡冷启动待验收 |
+| USB Host 带电扩展坞自愈 | ✅ | `ensure_usb_host_mode()`（严守 `mode=peripheral`）重插 30–60 秒自动恢复并验证边充边用；配套 0-KABI 补丁 `fix_oplus_warp_probe.patch` |
+| 开机自启 | ✅ | 2026-11-27 千兆（RTL8153）免手操冷启动通过（单 `procd`、0 泄漏）；2.5G 网卡冷启动待复验 |
 
 详细的测试过程、缺陷与修复记录见 **[`TEST_REPORT.md`](TEST_REPORT.md)**。
 
@@ -164,8 +167,9 @@ EFS 写入重启后保持（已验证多次重启）。
 | `CONFIG_PID_NS` | ❌ | ✅ | 容器内 `procd` 安全当 PID 1 |
 | `CONFIG_DEVTMPFS` | ❌ | ✅ | 容器 `/dev` 正常 |
 | `CONFIG_MACVLAN` | ❌ | ✅ | 备用网络方案 |
-| 内置 `r8152 v2.22.1` | 旧驱动 | ✅ | RTL8156/B 2.5G |
+| 内置 `r8152 v2.22.1` | 旧驱动 | ✅ | RTL8156/B 2.5G 与 RTL8153 1G |
 | OPlus 指纹驱动 | 原厂名 | ✅ | 修复 `fps_hal` 崩溃与开机弹窗 |
+| OPLUS WARP 探测开关 | 无 | ✅（`fix_oplus_warp_probe.patch`） | 默认 `disable_warp_probe=1` 避免 `switch1_gpio:1` 抢占 USB D+/D-，0 KABI 影响，运行时可逆 |
 
 为了不破坏原厂 99 个 `.ko` 的 ABI，自定义内核坚持 **最小 KABI 变更**：
 
@@ -196,7 +200,7 @@ EFS 写入重启后保持（已验证多次重启）。
 - 只有 USB 网卡被直通，容器拿到真实 LAN 口；
 - 容器内统一改名为 `eth0`，配置 `192.168.2.1/24`；
 - 宿主不再参与 LAN 侧 DHCP/NAT，避免双层 NAT；
-- 网卡热插拔由 `04` 的重新探测 + 自启看门狗兜底。
+- 网卡热插拔与带电扩展坞供电重插由 `ensure_usb_host_mode()`（严守 `mode=peripheral` 不影响 PC USB）+ `04` 重新探测 + 30 秒看门狗自动热挂兜底。
 
 ### 3.6 IPv6
 
@@ -217,6 +221,7 @@ sm8350_lahaina/
 ├── anykernel/                  # AnyKernel3 配置
 ├── magisk/                     # r8152 兜底 Magisk 模块模板
 ├── scripts/                    # 03/04/05b/06、备份、KABI 校验
+├── fix_oplus_warp_probe.patch  # 0-KABI 内核补丁：默认跳过 OPLUS WARP D+/D- 探测
 ├── artifacts/                  # 构建产物（本地，不提交）
 ├── magisk_patch/               # 原厂 Root 回滚 boot（本地，不提交）
 ├── Cellular/                   # 5G n41+n79 CA 修复、QMI/抓包工具与记录
@@ -244,7 +249,7 @@ OpenWrt 相关的包、软件、配置、脚本、镜像、状态、日志**只�
 Magisk 只保留一个入口：
 
 ```text
-/data/adb/service.d/00_openwrt.sh   # 一行 exec，指向 /data/openwrt/scripts/service_openwrt_autorun.sh
+/data/adb/service.d/00_openwrt.sh   # 清除 Magisk ASH_STANDALONE 并 exec /system/bin/sh /data/openwrt/scripts/service_openwrt_autorun.sh
 ```
 
 不得再创建 `/data/adb/openwrt/`，也不要把 OpenWrt 脚本/包放到 `/sdcard`、`/data/local/tmp`。
@@ -306,14 +311,14 @@ adb shell su -c "sh /data/openwrt/scripts/04_start_openwrt_and_network.sh"
 ## 7. 已知限制
 
 1. **21.02 已 EOL**：feed 冻结；换 23.05 需要禁用 `fw4`，换 24.10 还要处理 `apk`。
-2. **容器里的防火墙没有实际运行**：`fw3` 未启动，NAT/WAN 防火墙在 Android 宿主侧；容器内 `INPUT` 为空。不要把它当成安全边界。
+2. **容器防火墙与宿主边界**：容器内 `fw3`（`iptables-legacy`）已由 `04` 末尾重启并由 30 秒看门狗 `ensure_container_fw()` 自动自愈（`Allow-Host-UI` 与 `MASQUERADE` 均生效），但无 user namespace/cgroup 隔离，外层 WAN 与原生 IPv6 转发边界仍在 Android 宿主侧。
 3. **没有 user namespace / cgroup 隔离**：容器 root 就是宿主 root。
 4. **Android 必须先启动**：容器由 Magisk `service.d` 在 Android 起来后拉起，不是独立双系统。
 5. **5G 对 OpenWrt 不可见**：没有 QMI/MBIM，WAN 依赖 Android 数据连接。
 6. **内部 WiFi 不能直通**：热点仍是 Android 的 AP，其客户端在 `192.168.69.0/24`，与容器 LAN 隔离。
 7. **IPv6 前缀变化不会自动刷新**：重拨后运营商 `/64` 可能变化，需要重跑 `04` 或重启；脚本目前只处理 `/64`。
 8. **Android OTA 会覆盖 `boot` / `vbmeta`**：升级后要重新验证 KABI 并重新刷内核。
-9. **USB 网卡冷启动待验收**：当前只验证了 WAN-only 自启路径。
+9. **2.5G 网卡冷启动与长稳测试待验收**：千兆 USB 网卡（RTL8153 `0bda:8153`，USB 3.0 5 Gbps）免手操冷启动已于 2026-11-27 通过，2.5G 网卡（RTL8156B/BG）冷启动及 24–72 小时耐力测试仍待验收；另非 PD 5V 扩展坞重启不会主动发 `PR_SWAP`，如需免重插边充边用请选标准 USB-PD 扩展坞。
 10. **AG / Clash 未预装**：容器具备 `TPROXY` / `TUN` / iptables 能力，但需要自行部署，且只能用 iptables，不能用 nftables。
 11. **手机 RTC 不可写**：`hwclock -w` 返回 `RTC_SET_TIME: Permission denied`（Permissive 下也一样），RTC 仍停在 1970；Android 依靠 NTP 校正，容器已完全禁止读写 RTC。详见 [`TIME_NOTES.md`](TIME_NOTES.md)。
 12. **5G CA 依赖 modem EFS**：`n41+n79` 修复写在运行时 NV，不随 OpenWrt 容器；系统 OTA / 恢复出厂可能覆盖，需要复查并按 [`Cellular/README.md`](Cellular/README.md) 重新写入。

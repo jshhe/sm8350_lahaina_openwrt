@@ -4,8 +4,8 @@
 > 系统：OOS 14 `LE2120_14.0.0.1901`
 > 内核：`5.4.254-qgki-gd2a1055adeb0`（自定义，GitHub Actions build `40346641157` / run4）
 > OpenWrt：21.02.7 `armvirt/64`
-> 最后一次上机：2026-11-03
-> 结论：**主链路可用**；插网卡冷启动、23.05 用户态、AG/Clash 属于未完成/可选项。
+> 最后一次上机：2026-11-27
+> 结论：**主链路与千兆 USB 网卡（RTL8153）免手操冷启动验收已通过**；2.5G 网卡冷启动复验、24–72 小时耐力测试、含 `fix_oplus_warp_probe.patch` 新内核上机验证以及 23.05 用户态 / AG / Clash 属于待验收/可选项。
 
 ---
 
@@ -29,13 +29,18 @@
 | Container | `dnsmasq` / `odhcpd` | ✅ |
 | Network | LAN DHCP / NAT / 5G 出口 | ✅ |
 | Network | 宿主访问容器 LuCI | ✅ |
-| IPv6 | 原生 `/64` / RA / 外网 | ✅ |
-| LuCI | 中文界面 | ✅ |
+| IPv6 | 原生 `/64` / RA / `table 200 via fe80::2` / 外网 | ✅ |
+| Firewall | 容器 `fw3`（`Allow-Host-UI` + `MASQUERADE`）自愈 | ✅ |
+| LuCI | 中文界面（PC `192.168.2.1` + 手机 `10.200.1.2`） | ✅ |
+| Autostart | Magisk `ASH_STANDALONE` 隔离 + 单容器防泄漏 | ✅ |
 | Autostart | WAN-only 自启 / 看门狗 | ✅ |
+| USB Host | 带电扩展坞供电重插 30–60s 自愈 + 边充边用 | ✅ |
 | Clock | 容器不再改写 Android 时钟 | ✅ |
 | Clock | 重启后 NTP 自动校正 | ✅ |
 | Cleanup | 泄漏实例/进程树清理 | ✅ |
-| Autostart | 插 2.5G 网卡冷启动 | ⏳ 待验收 |
+| Autostart | 插千兆网卡（RTL8153）免手操冷启动 | ✅（2026-11-27） |
+| Autostart | 插 2.5G 网卡（RTL8156B/BG）冷启动复验 | ⏳ 待验收 |
+| Endurance | 连续运行 24–72 小时稳定性 | ⏳ 待验收 |
 
 ---
 
@@ -289,10 +294,10 @@ ip rule:
 - 从 `rmnet_dataX` 读取运营商全局 `/64`；
 - 容器 `eth0` 配 `::1/64`；
 - `veth-host` / `veth-owrt` 使用 `fe80::1` / `fe80::2`；
-- 宿主 table 200/201 + rule 1000/1001；
+- 宿主 table 200（`via fe80::2 dev veth-host onlink`）/ table 201 + rule 1000/1001；
 - 容器 `odhcpd` 发 RA；
-- PC 获得同 `/64` 地址；
-- PC 可 ping 容器 `::1`，也可 ping `2400:3200::1`；
+- PC（`以太网 3`，RTL8153 1 Gbps）自动获得同 `/64` 地址；
+- PC 可 ping 容器 `::1`，也可 ping `2400:3200::1`（热修验证 34–53 ms、冷启动验收 44–48 ms，0% 丢包）；
 - **没有 NAT66，没有 ULA**。
 
 详见 [`IPV6_NOTES.md`](IPV6_NOTES.md)。
@@ -314,6 +319,10 @@ ip rule:
 | 11 | 电源守护不启动 | PID 复用误判 | 校验 cmdline |
 | 12 | 迁移后新守护不启动 | 旧进程占用 pid 文件 | 杀旧进程 + 清 pid |
 | 13 | 守护挂了没人拉 | 看门狗只检查容器 | 每 30 秒调用守护 |
+| 14 | Magisk `service.d` 下 `veth-owrt` 失败且每 30s 泄漏容器 | Magisk 在 BusyBox ash `ASH_STANDALONE=1` 模式运行（忽略 `PATH`），BusyBox `ip`/`ps` 缺失所需能力 | `00_openwrt.sh`/`autorun`/`04` 三层 `unset ASH_STANDALONE` + `exec /system/bin/sh` + 严格 `pgrep -P` |
+| 15 | PC 原生 IPv6 ping 外网 100% 丢包 | 宿主 `table 200` 缺下一跳（`dev veth-host`），Android 在 `veth-host` 上对 LAN 客户端发 NDP 解析失败 | 改为 `via fe80::2 dev veth-host onlink table 200`，PC ping `2400:3200::1` 恢复 34–53 ms、0% 丢包 |
+| 16 | 冷启动后容器 `fw3` 规则不完整 | `04` 与 `procd`/`S19firewall` 及异步 `netifd reload` 竞态 | 将 `/etc/init.d/firewall restart` 移到 `04` 末尾校验重试，看门狗新增 `ensure_container_fw()` 自愈 |
+| 17 | 带电扩展坞重插后 `eth0` 掉线、`error -71` | 非 PD 5V 坞 VBUS 触发 `oplus_otg_disable_work`（`mode=none`），充电时 OPLUS WARP 探测切 `switch1_gpio:1` 抢占 D+/D- | 用户态新增 `ensure_usb_host_mode()`（保护 `mode=peripheral`）+ 热挂看门狗；内核新增 0-KABI 补丁 `fix_oplus_warp_probe.patch` |
 
 ---
 
@@ -339,22 +348,21 @@ ip rule:
 
 ```text
 /data/adb/service.d/00_openwrt.sh
-  └── exec sh /data/openwrt/scripts/service_openwrt_autorun.sh
+  ├── unset ASH_STANDALONE
+  └── exec /system/bin/sh /data/openwrt/scripts/service_openwrt_autorun.sh
 ```
 
-已验证（WAN-only，USB 网卡未插）：
+已验证（WAN-only + 2026-11-27 千兆 RTL8153 冷启动与供电重插自愈）：
 
-- 脚本等到 `boot_completed`；
-- 等到 5G 默认路由；
-- 容器未运行时执行 `04`；
-- `eth0` 不存在时记录 WARN，但 WAN 仍可用；
-- 每 30 秒 `ensure_wan` 重断言转发/路由；
-- 守护被杀后能被看门狗拉起。
+- 脚本先清除 `ASH_STANDALONE` 并切换到 Android `/system/bin/sh`，等待 `sys.boot_completed=1` 与 5G 活跃路由（最多 180 秒）；
+- 调用 `ensure_usb_host_mode()`（严守 `mode=peripheral` 不碰 PC USB）并等待 USB 网卡（最多 30 秒）；
+- 容器未运行时以 `/system/bin/sh` 执行 `04`，`eth0` 未出现时先以 WAN-only 启动；
+- 每 30 秒看门狗：`ensure_wan()` 重断言转发/路由/宿主 `iptables`；拉起电源守护；容器异常时重启；容器为 WAN-only 且检测到 `eth0` 热插拔/重插恢复时自动重跑 `04` 挂载；LAN 在位时通过 `ensure_container_fw()` 自愈 `fw3` 的 `Allow-Host-UI` 与 `MASQUERADE`。
 
-未验证：
+待复验：
 
-- 拔掉 USB 数据线、插 2.5G 网卡、重启手机后，`eth0` 是否能稳定在容器启动前出现；
-- 若网卡枚举较晚，`04` 首次可能以 WAN-only 启动，需要看门狗或人工重跑才能把 `eth0` 移入容器。
+- 2.5G USB 网卡（RTL8156B/BG）的同流程免手操冷启动复验（本次冷启动验收使用千兆 RTL8153 `0bda:8153`）；
+- 24–72 小时连续运行稳定性。
 
 ---
 
@@ -406,6 +414,78 @@ hwclock: ioctl RTC_SET_TIME: Permission denied
 
 ---
 
+### 8.2 2026-11-27 故障排查、供电重插自愈与免手操冷启动验收
+
+#### 8.2.1 Magisk `ASH_STANDALONE=1` 根因与三层修复
+
+现象：开机后自启日志持续报 `ERROR: veth peer veth-owrt was not created`、`04 exit=1`，每 30 秒重试并不断泄漏容器实例（实测启动 6 分钟内已累积 7 个容器实例，且每次都误拾取旧容器 PID）。
+
+根因：Magisk 以 BusyBox `ash` 独立模式（`ASH_STANDALONE=1`）执行 `service.d` 脚本，此时任何不含 `/` 的命令（`ip`、`ps`、`sh`、`awk`、`readlink`）都会被强制解析为 BusyBox applet，完全忽略脚本内设置的 `PATH`：
+
+1. BusyBox `ip` 无法创建带命名 peer 的 veth 对（`veth-owrt` 静默缺失）；
+2. BusyBox `ps` 不支持 `-A -o`，导致 `kill_container_tree()` 清理与容器 init PID 探测全部失效。
+
+修复：
+
+- 三层清除 `ASH_STANDALONE` 并重执 `/system/bin/sh`：`/data/adb/service.d/00_openwrt.sh`、`service_openwrt_autorun.sh`、`scripts/04_start_openwrt_and_network.sh`（同时 `service_openwrt_autorun.sh` 与 `service_power_guard.sh` 显式调用 `/system/bin/sh`）；
+- `04` 改用严格 `pgrep -P "$UNSHARE_PID"`（回退 `ps -A -o PID,PPID`）定位新容器 init PID，绝不回退匹配任意 rootfs 进程，并在清理残留 `procd` 时补全 rootfs 回退查杀。
+
+验证：重启后 `service_openwrt_autorun.sh` 实测 `exe=/system/bin/sh ASH=unset`，系统内仅保留 **1 个 `procd`**，0 泄漏。
+
+#### 8.2.2 原生 IPv6 `table 200` 下一跳修复
+
+现象：PC 获取到了运营商 `/64` 地址，但 `ping -6 2400:3200::1` 100% 丢包。
+
+根因：`04` 原先在宿主 `table 200` 写入 `<prefix>::/64 dev veth-host`（无下一跳），导致 Android 收到 5G 回程包时在 `veth-host` 上对 LAN 客户端发 NDP 邻居解析并失败。
+
+修复：`scripts/04_start_openwrt_and_network.sh` 将 `table 200` 改为 `ip -6 route replace "$V6_NET" via fe80::2 dev "$VETH_HOST" onlink table 200`。
+
+验证：PC（`以太网 3`，RTL8153 1 Gbps）立即 ping 通 `2400:3200::1`，实测延迟 **34–53 ms、0% 丢包**。
+
+#### 8.2.3 容器 `fw3` 启动竞态与看门狗自愈
+
+现象：容器刚启动时偶发 `zone_wan_input`（`Allow-Host-UI`）或 `zone_wan_postrouting`（`MASQUERADE`）规则缺失。
+
+修复：将 `/etc/init.d/firewall restart` 移至 `04` 末尾（`netifd` 与 IPv6 全部稳定之后）并做一次校验重试；在 `service_openwrt_autorun.sh` 的 30 秒看门狗中新增 `ensure_container_fw()`，缺失时自动重启防火墙自愈。
+
+验证：冷启动日志中 `04` 首次报 `WARN: container fw3 rules incomplete after firewall restart`，随后看门狗自动完成自愈，容器内 `-A zone_wan_postrouting -m comment --comment "!fw3" -j MASQUERADE` 与 `Allow-Host-UI` 均正常生效。
+
+#### 8.2.4 带电扩展坞（非 PD 5V）定位、供电重插自愈与 0-KABI 内核补丁
+
+实测一款非 PD 5V 带电 Type-C 扩展坞（`power_operation_mode=default`，被 OPLUS 充电子系统识别为 `[BrickID]` / `USB_DCP`），观察到两类问题：
+
+1. **冷重启角色**：非 PD 坞不会在手机重启后发起 USB-PD `PR_SWAP`，重启后停留在 `power_role=[source]`（手机给坞供电、`Not charging`），需插拔一次供电才切回 `power_role=[sink]` 充电；
+2. **重插供电与 WARP 探测干扰**（`dmesg` 实证）：
+   - 接入外部 5V VBUS 触发 `oplus_otg_disable_work`，关闭 `otg_switch` 并注销 xHCI 总线（`r8152` `status -108` 断开，`a600000.ssusb` 跌回 `mode=none`）；
+   - 恢复 `mode=host` 后，只要充电处于开启状态（`mmi_charging_enable=1`），`oplus_chg_fast_switch_check()` 看到 `POWER_SUPPLY_TYPE_USB_DCP` 便反复翻转硬件 D+/D- 开关 `switch1_gpio:1`（`warp mode`）并触发 `smbchg_usb_suspend_enable`（`reset adapter`），劫持 USB D+/D- 导致 `usb 2-1: device descriptor read/64, error -71`。
+
+用户态修复与实测：
+
+- 在 `service_openwrt_autorun.sh` 与 `scripts/04_start_openwrt_and_network.sh` 中新增 `ensure_usb_host_mode()`（严守 `mode=peripheral` 护栏，绝不触碰 PC USB 数据线；仅在 `mode=none` 或 `mode=host` 且无 xHCI 设备、`otg_online != 0` 且 `data_role=[host]` 时暂关 `mmi_charging_enable` 并恢复 Host 枚举），并在 30 秒看门狗中加入 WAN-only 自动热挂逻辑；
+- **供电重插自愈实测通过**：带电重插后 ~30–60 秒自动恢复 USB Host、`eth0` 与容器路由，并实测 **边充边用**（充电电流 `cur=-211 mA`，电量 `58% -> 59%`）期间 `eth0` 持续 `UP`。
+
+内核侧根治（0-KABI 补丁）：
+
+- 新增 `fix_oplus_warp_probe.patch`（已集成至 `.github/workflows/build_kernel.yml`）：在 `drivers/power/oplus_chg/oplus_charger.c` 的 `oplus_chg_fast_switch_check()`（`chip->mmi_chg == 0` 检查之后）加入模块参数 `/sys/module/oplus_chg/parameters/disable_warp_probe`（默认 `1`），直接返回并打印 `disable_warp_probe,return`，彻底停止 `switch1_gpio:1` WARP 探测，同时保留正常 5V / USB-PD 充电；
+- 不修改任何结构体或导出符号（1,607 KABI CRC 保持 100% 匹配），且运行时可随时 `echo 0 > /sys/module/oplus_chg/parameters/disable_warp_probe` 恢复。
+
+#### 8.2.5 免手操冷启动验收结果（2026-11-27，PASSED）
+
+测试条件：拔掉 PC 调试 USB 线，接入带电 Type-C 扩展坞 + 千兆 USB 网卡（RTL8153，`0bda:8153`），执行手机冷重启，全程不人工干预。
+
+| 验收项 | 实测结果 | 结论 |
+| :--- | :--- | :---: |
+| USB 枚举与驱动 | `3-1` `0bda:8153`，USB 3.0 SuperSpeed Gen 1（`speed=5000`，5 Gbps），内置 `r8152 v2.22.1` | ✅ |
+| 进程与容器卫生 | `service_openwrt_autorun.sh` 运行于 `/system/bin/sh`（`ASH_STANDALONE` 已清除）；单 `procd`（0 泄漏）；`netifd`/`uhttpd`/`dnsmasq`/`odhcpd` 与 `05b_cpu_charge_guard.sh` 全在位 | ✅ |
+| 容器防火墙 | `fw3` `zone_wan_postrouting`（`MASQUERADE`）+ `zone_wan_input`（`Allow-Host-UI`）自动生效 | ✅ |
+| PC DHCP / IPv6 | PC（`以太网 3`，RTL8153 1 Gbps）自动获得 `192.168.2.227/24` + 运营商原生 `/64`（真实前缀已脱敏，无 NAT66/ULA） | ✅ |
+| LuCI 管理页 | PC `http://192.168.2.1/` 与手机浏览器 `http://10.200.1.2/` 均可正常打开 | ✅ |
+| IPv4 外网 | PC `ping 223.5.5.5`：**45–69 ms，0% 丢包** | ✅ |
+| IPv6 外网 | PC `ping -6 2400:3200::1`：**44–48 ms，0% 丢包** | ✅ |
+| 电源守护 | `cpu7=0`，`cap=59%`，`mmi_charging_enable=0`（Not charging） | ✅ |
+
+---
+
 ## 9. 仓库与发布卫生
 
 - 117 个分区全量备份 14.29 GiB，SHA256 校验通过；
@@ -420,31 +500,36 @@ hwclock: ioctl RTC_SET_TIME: Permission denied
 
 ## 10. 未完成 / 可选项
 
-1. **插网卡冷启动验收**（最高优先级）；
-2. 23.05.5 `armsr/armv8` rootfs + 禁用 `fw4` 的旁路测试；
-3. 容器内 AdGuard Home / Clash（仅服务 USB LAN 客户端）；
-4. USB WiFi 网卡 + 内核内置驱动（让 OpenWrt 自己发 WiFi）；
-5. Android OTA 后的 KABI 复验流程自动化。
+1. **2.5G 网卡（RTL8156B/BG）冷启动复验与 24–72 小时耐力测试**（千兆 RTL8153 免手操冷启动已于 2026-11-27 通过）；
+2. **刷入含 `fix_oplus_warp_probe.patch` 的新版内核并实测验证**（确认 `disable_warp_probe=Y` 且充电时零 `switch1_gpio:1`）；
+3. 23.05.5 `armsr/armv8` rootfs + 禁用 `fw4` 的旁路测试；
+4. 容器内 AdGuard Home / Clash（仅服务 USB LAN 客户端）；
+5. USB WiFi 网卡 + 内核内置驱动（让 OpenWrt 自己发 WiFi）；
+6. Android OTA 后的 KABI 复验流程自动化。
 
 ---
 
 ## 11. 复现命令
 
 ```bash
-# 内核与 KABI
+# 内核与 KABI / WARP 开关
 adb shell uname -r
 adb shell su -c "grep -c 'rtl8152' /proc/kallsyms"
 adb shell su -c "/data/adb/magisk/busybox unshare -p -f sh -c 'echo pid=\$\$'"
+adb shell su -c "cat /sys/module/oplus_chg/parameters/disable_warp_probe"
 
-# 容器
+# 容器与防泄漏检查
 adb shell su -c "cat /data/openwrt/run/container.pid"
+adb shell su -c "ps -A -o PID,PPID,NAME | grep procd"
 adb shell su -c "tail -20 /data/openwrt/logs/autorun.log"
 
-# 网络
-adb shell su -c "ip rule; ip route show table 100; ip -6 rule"
+# 网络与容器防火墙
+adb shell su -c "ip rule; ip route show table 100; ip -6 rule; ip -6 route show table 200"
 adb shell su -c "/data/adb/magisk/busybox wget -O - http://10.200.1.2/ | head"
+adb shell su -c "P=\$(cat /data/openwrt/run/container.pid); /data/adb/magisk/busybox nsenter -t \$P -m -u -n -p -- /system/bin/chroot /data/openwrt/rootfs /bin/sh -c 'export PATH=/usr/sbin:/usr/bin:/sbin:/bin; iptables -t nat -S zone_wan_postrouting; iptables -S zone_wan_input'"
 
-# 电源
+# USB Host 与电源
+adb shell su -c "cat /sys/devices/platform/soc/a600000.ssusb/mode /sys/class/typec/port0/data_role /sys/class/typec/port0/power_role"
 adb shell su -c "cat /sys/devices/system/cpu/cpu7/online"
 adb shell su -c "cat /sys/class/oplus_chg/battery/capacity"
 adb shell su -c "cat /sys/class/oplus_chg/battery/mmi_charging_enable"

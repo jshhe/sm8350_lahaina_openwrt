@@ -1,4 +1,13 @@
 #!/system/bin/sh
+# Magisk runs boot scripts with BusyBox ash in "standalone" mode
+# (ASH_STANDALONE=1): every command without a slash -- ps, ip, awk, readlink --
+# then resolves to a BusyBox applet regardless of PATH.  BusyBox ps has no -A
+# (container PID detection and leak cleanup silently find nothing) and BusyBox
+# ip cannot create a named veth peer.  Re-exec under Android's mksh.
+if [ -n "$ASH_STANDALONE" ]; then
+    unset ASH_STANDALONE
+    exec /system/bin/sh "$0" "$@"
+fi
 # Android's toybox ip is required for named veth pairs and netns operations.
 # Magisk's PATH can put BusyBox ip first, which silently fails to create the
 # peer; keep toybox first and call BusyBox only via $BB.
@@ -120,12 +129,97 @@ cleanup_old_container() {
     sleep 2
     kill_container_tree KILL
     sleep 1
+    if ps -A -o PID,NAME 2>/dev/null | awk '$2=="procd"' | grep -q .; then
+        kill_container_rootfs_fallback KILL
+    fi
     rm -f "$RUN_DIR/container.pid"
     # Remove stale veth pairs from earlier failed attempts.  The toybox/busybox
     # split is important: toybox creates a correct pair only with "name ...".
     for v in "$VETH_HOST" veth0 veth1; do
         ip link show "$v" >/dev/null 2>&1 && ip link del "$v" 2>/dev/null
     done
+}
+
+# Return 0 if xhci buses 2/3 currently have any enumerated USB child device.
+usb_host_has_devices() {
+    for d in /sys/bus/usb/devices/2-[0-9]* /sys/bus/usb/devices/3-[0-9]*; do
+        [ -f "$d/idVendor" ] && return 0
+    done
+    return 1
+}
+
+# Recover USB host mode when a powered Type-C hub/dock is attached.
+# On OPLUS/OOS 14:
+#   1) VBUS from a PD hub triggers oplus_chg to disable otg_switch and drop
+#      dwc3 back to mode=none even though Type-C negotiated data_role=[host].
+#   2) While charging is enabled (mmi_charging_enable=1), oplus_chg's WARP
+#      detection flips switch1_gpio=1 and hijacks USB D+/D-, causing error -71
+#      and leaving mode=host with zero enumerated devices.
+# Guard strictly so a PC USB connection (mode=peripheral) is never touched.
+ensure_usb_host_mode() {
+    mode_f="/sys/devices/platform/soc/a600000.ssusb/mode"
+    otg_sw="/sys/class/oplus_chg/usb/otg_switch"
+    otg_on="/sys/class/oplus_chg/usb/otg_online"
+    role_f="/sys/class/typec/port0/data_role"
+    mmi_f="/sys/class/oplus_chg/battery/mmi_charging_enable"
+    cap_f="/sys/class/oplus_chg/battery/capacity"
+
+    [ -r "$mode_f" ] || return 0
+    mode=$(cat "$mode_f" 2>/dev/null)
+    case "$mode" in
+        none) ;;
+        host)
+            usb_host_has_devices && return 0
+            ;;
+        *) return 0 ;;
+    esac
+
+    if [ -w "$otg_sw" ] && [ "$(cat "$otg_sw" 2>/dev/null)" != "1" ]; then
+        echo 1 > "$otg_sw" 2>/dev/null
+    fi
+
+    online=$(cat "$otg_on" 2>/dev/null)
+    role=$(cat "$role_f" 2>/dev/null)
+    case "$online" in
+        ''|0) return 0 ;;
+    esac
+    case "$role" in
+        *'[host]'*)
+            log "Type-C host dock detected (mode=$mode, otg_online=$online, no USB NIC); recovering host mode"
+            old_mmi=$(cat "$mmi_f" 2>/dev/null)
+            # Pause charging during enumeration so oplus_chg_fast_switch_check
+            # returns immediately instead of flipping switch1_gpio=1 (WARP D+/D- mux).
+            if [ "$old_mmi" = "1" ] && [ -w "$mmi_f" ]; then
+                echo 0 > "$mmi_f" 2>/dev/null
+                sleep 1
+            fi
+            if [ "$mode" = "host" ]; then
+                echo none > "$mode_f" 2>/dev/null
+                sleep 2
+            fi
+            echo 1 > "$otg_sw" 2>/dev/null
+            echo host > "$mode_f" 2>/dev/null || return 0
+            k=0
+            while [ $k -lt 6 ]; do
+                for iface in "$LAN_IF" eth0 usb0 eth1; do
+                    if ip link show "$iface" >/dev/null 2>&1; then
+                        # Only re-enable charging if battery is at/below resume floor (50%).
+                        soc=$(cat "$cap_f" 2>/dev/null)
+                        if [ "$old_mmi" = "1" ] && [ -n "$soc" ] && [ "$soc" -le 50 ] 2>/dev/null; then
+                            echo 1 > "$mmi_f" 2>/dev/null
+                        fi
+                        return 0
+                    fi
+                done
+                sleep 1
+                k=$((k+1))
+            done
+            soc=$(cat "$cap_f" 2>/dev/null)
+            if [ "$old_mmi" = "1" ] && [ -n "$soc" ] && [ "$soc" -le 50 ] 2>/dev/null; then
+                echo 1 > "$mmi_f" 2>/dev/null
+            fi
+            ;;
+    esac
 }
 
 cleanup_on_exit() {
@@ -226,10 +320,20 @@ fi
 [ -n "$V6_NET" ] && log "Native IPv6 prefix: $V6_NET (no NAT66)" || log "WARN: no global /64 on $RMNET_IF; IPv6 LAN disabled"
 
 # ------------------------------------------------------------------------------
-# Find the USB NIC.
+# Find the USB NIC (recovering OPLUS USB host mode first if a powered dock was
+# dropped back to ssusb mode=none).
 # ------------------------------------------------------------------------------
 if ! ip link show "$LAN_IF" >/dev/null 2>&1; then
     for iface in eth0 usb0 eth1; do
+        if ip link show "$iface" >/dev/null 2>&1; then
+            LAN_IF="$iface"
+            break
+        fi
+    done
+fi
+if ! ip link show "$LAN_IF" >/dev/null 2>&1; then
+    ensure_usb_host_mode
+    for iface in "$LAN_IF" eth0 usb0 eth1; do
         if ip link show "$iface" >/dev/null 2>&1; then
             LAN_IF="$iface"
             break
@@ -280,28 +384,25 @@ $UNSHARE $NS_FLAGS /system/bin/sh -c '
     exec /system/bin/chroot "$ROOTFS" /sbin/init
 ' sh "$ROOTFS" </dev/null >$LOG_DIR/init.log 2>&1 &
 UNSHARE_PID=$!
+# From here on a failed startup must tear the new container down again.
+CONTAINER_STARTED=1
 
-# Wait for the PID-namespace init instead of racing a fixed sleep.  Using the
-# wrapper PID as container PID leaves the real init alive when startup fails.
+# Wait for the PID-namespace init (the only child of the unshare wrapper)
+# instead of racing a fixed sleep.  Using the wrapper PID as container PID
+# leaves the real init alive when startup fails.
 CONTAINER_PID=""
 i=0
 while [ $i -lt 20 ]; do
-    CONTAINER_PID=$(ps -A -o PID,PPID 2>/dev/null | awk -v p="$UNSHARE_PID" '$2==p {print $1; exit}')
+    CONTAINER_PID=$(pgrep -P "$UNSHARE_PID" 2>/dev/null | head -n 1)
+    [ -n "$CONTAINER_PID" ] || CONTAINER_PID=$(ps -A -o PID,PPID 2>/dev/null | awk -v p="$UNSHARE_PID" '$2==p {print $1; exit}')
     [ -n "$CONTAINER_PID" ] && break
+    [ -d "/proc/$UNSHARE_PID" ] || break
     sleep 1
     i=$((i+1))
 done
-if [ -z "$CONTAINER_PID" ]; then
-    for p in /proc/[0-9]*; do
-        pid=${p#/proc/}
-        root=$(readlink "$p/root" 2>/dev/null) || continue
-        case "$root" in
-            "$ROOTFS"|"$ROOTFS"/*) CONTAINER_PID="$pid"; break ;;
-        esac
-    done
-fi
+# Never fall back to "any process whose root is the rootfs": with leaked
+# instances around, that picked the oldest dead container and moved eth0 into it.
 [ -n "$CONTAINER_PID" ] || { log "ERROR: container init not found; check $LOG_DIR/init.log"; exit 1; }
-CONTAINER_STARTED=1
 echo "$CONTAINER_PID" > "$RUN_DIR/container.pid"
 log "unshare wrapper PID: $UNSHARE_PID, container init PID: $CONTAINER_PID"
 [ -d "/proc/$CONTAINER_PID" ] || { log "ERROR: container exited; check $LOG_DIR/init.log"; exit 1; }
@@ -369,15 +470,23 @@ owrt_exec() {
     $NSENTER -t "$CONTAINER_PID" -m -u -n -p -- /system/bin/chroot "$ROOTFS" /bin/sh -c "export PATH=/usr/sbin:/usr/bin:/sbin:/bin; $*"
 }
 
-# Let procd settle, then reload network/firewall/dnsmasq so they see the
-# interfaces that appeared after init started.
-sleep 2
+# Wait for ubusd + netifd to finish booting before reloading network.
+i=0
+while [ $i -lt 15 ]; do
+    if owrt_exec "ubus list network.interface.wan >/dev/null 2>&1"; then
+        break
+    fi
+    sleep 1
+    i=$((i+1))
+done
 owrt_exec "/etc/init.d/network reload" 2>/dev/null
-owrt_exec "/etc/init.d/firewall reload" 2>/dev/null
-owrt_exec "/etc/init.d/dnsmasq restart" 2>/dev/null
-# netifd applies 'network reload' asynchronously; let it settle before the
-# IPv6 LAN address is added, otherwise it gets flushed again.
+# netifd applies 'network reload' asynchronously; let it settle before
+# adding the IPv6 LAN address and restarting firewall at the end.
 sleep 2
+$NSENTER -t "$CONTAINER_PID" -n -- ip link set "$VETH_OWRT" up 2>/dev/null
+$NSENTER -t "$CONTAINER_PID" -n -- ip addr add "$OWRT_IP/30" dev "$VETH_OWRT" 2>/dev/null
+$NSENTER -t "$CONTAINER_PID" -n -- ip route replace default via "$HOST_IP" dev "$VETH_OWRT" 2>/dev/null
+owrt_exec "/etc/init.d/dnsmasq restart" 2>/dev/null
 
 # Native IPv6: the LAN address, /64 route and odhcpd/dnsmasq restarts are done
 # in the host-forwarding block below, after netifd's reload has settled.
@@ -420,7 +529,9 @@ if [ -n "$V6_NET" ]; then
     else
         log "WARN: LAN NIC not in container; IPv6 LAN address skipped"
     fi
-    ip -6 route replace "$V6_NET" dev "$VETH_HOST" table 200 2>/dev/null \
+    # Route the LAN /64 via the container's link-local next hop (fe80::2) so
+    # Android does not try to resolve LAN hosts via NDP on veth-host.
+    ip -6 route replace "$V6_NET" via fe80::2 dev "$VETH_HOST" onlink table 200 2>/dev/null \
         || log "WARN: could not add IPv6 route table 200"
     ip -6 rule del iif "$RMNET_IF" lookup 200 2>/dev/null
     ip -6 rule add iif "$RMNET_IF" lookup 200 pref 1000
@@ -518,8 +629,21 @@ if [ -n "$V6_NET" ]; then
         $NSENTER -t "$CONTAINER_PID" -n -- ip -6 addr add "$V6_LAN_ADDR/64" dev eth0 2>/dev/null
         $NSENTER -t "$CONTAINER_PID" -n -- ip -6 route replace "$V6_NET" dev eth0 2>/dev/null
     fi
-    ip -6 route replace "$V6_NET" dev "$VETH_HOST" table 200 2>/dev/null
+    ip -6 route replace "$V6_NET" via fe80::2 dev "$VETH_HOST" onlink table 200 2>/dev/null
     owrt_exec "/etc/init.d/odhcpd restart" 2>/dev/null
+fi
+
+# Final firewall restart once procd/S19firewall and netifd have settled so both
+# filter (Allow-Host-UI) and nat (MASQUERADE) tables are guaranteed populated.
+owrt_exec "/etc/init.d/firewall restart" >/dev/null 2>&1
+if ! owrt_exec "iptables -t nat -S zone_wan_postrouting 2>/dev/null | grep -q MASQUERADE && iptables -S zone_wan_input >/dev/null 2>&1"; then
+    sleep 3
+    owrt_exec "/etc/init.d/firewall restart" >/dev/null 2>&1
+fi
+if owrt_exec "iptables -t nat -S zone_wan_postrouting 2>/dev/null | grep -q MASQUERADE && iptables -S zone_wan_input >/dev/null 2>&1"; then
+    log "container fw3 filter + NAT active"
+else
+    log "WARN: container fw3 rules incomplete after firewall restart"
 fi
 
 # Final RTC mask: OpenWrt's preinit (and network reload) can mount devtmpfs over

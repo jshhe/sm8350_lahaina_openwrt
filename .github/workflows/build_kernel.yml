@@ -88,6 +88,14 @@ jobs:
           echo 'CFLAGS_r8152.o += -Wno-error' >> kernel/msm-5.4/drivers/net/usb/Makefile
           grep -n "linux/hex.h" kernel/msm-5.4/drivers/net/usb/r8152.c || true
 
+      - name: Apply OPLUS WARP D+/D- probe disable patch (0-KABI)
+        run: |
+          set -euo pipefail
+          cd kernel/msm-5.4
+          git apply --check -p1 "$GITHUB_WORKSPACE/fix_oplus_warp_probe.patch"
+          git apply -p1 "$GITHUB_WORKSPACE/fix_oplus_warp_probe.patch"
+          grep -n "disable_warp_probe" drivers/power/oplus_chg/oplus_charger.c
+
       - name: Prepare KABI-safe config (stock base + PID_NS + 2.5G)
         run: |
           export PATH="$GITHUB_WORKSPACE/toolchain/clang/bin:$GITHUB_WORKSPACE/toolchain/gcc64/bin:$GITHUB_WORKSPACE/toolchain/gcc32/bin:$PATH"

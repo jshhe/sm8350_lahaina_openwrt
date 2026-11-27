@@ -104,13 +104,28 @@ adb shell su -c "sh /data/openwrt/scripts/03_setup_openwrt_rootfs.sh"
 adb shell su -c "sh /data/openwrt/scripts/04_start_openwrt_and_network.sh"
 ```
 
-恢复自启：
+恢复自启（注意必须清掉 Magisk BusyBox ash 的 `ASH_STANDALONE`，交给 `/system/bin/sh`）：
 
 ```bash
-adb shell su -c "printf '#!/system/bin/sh\nexec sh /data/openwrt/scripts/service_openwrt_autorun.sh\n' > /data/adb/service.d/00_openwrt.sh"
+adb shell su -c "printf '#!/system/bin/sh\nunset ASH_STANDALONE\nexec /system/bin/sh /data/openwrt/scripts/service_openwrt_autorun.sh\n' > /data/adb/service.d/00_openwrt.sh"
 adb shell su -c "chmod 755 /data/adb/service.d/00_openwrt.sh"
 adb shell su -c "rm -f /data/openwrt/disable_autorun"
 ```
+
+### 2.5 扩展坞 USB Host / 容器 `fw3` / WARP 快充开关快速排查
+
+- **手机浏览器打不开 `http://10.200.1.2/` 或 PC 无外网**：确认容器 `fw3` 规则存在（看门狗每 30 秒也会自动自愈）：
+  ```bash
+  adb shell su -c "P=\$(cat /data/openwrt/run/container.pid); /data/adb/magisk/busybox nsenter -t \$P -m -u -n -p -- /system/bin/chroot /data/openwrt/rootfs /bin/sh -c 'export PATH=/usr/sbin:/usr/bin:/sbin:/bin; iptables -t nat -S zone_wan_postrouting; iptables -S zone_wan_input'"
+  ```
+- **带电扩展坞重插后 `eth0` 未立即出现**：等待 30–60 秒由 `ensure_usb_host_mode()` + 看门狗自动恢复；若使用非 PD 5V 扩展坞且冷重启后未充电（`power_role=[source]`），拔插一次扩展坞供电即可切回 `[sink]` 并在 30–60 秒内自动挂回 `eth0`。
+- **含 `fix_oplus_warp_probe.patch` 的内核如需临时恢复原厂 WARP 快充**（直插原装快充头、不接扩展坞时），无需重刷内核，直接运行时切换参数：
+  ```bash
+  # 临时恢复 WARP 探测（重启后自动恢复默认禁用 1）
+  adb shell su -c "echo 0 > /sys/module/oplus_chg/parameters/disable_warp_probe"
+  # 重新禁用 WARP 探测（保护 USB Host 网卡）
+  adb shell su -c "echo 1 > /sys/module/oplus_chg/parameters/disable_warp_probe"
+  ```
 
 ---
 

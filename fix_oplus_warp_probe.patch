@@ -1,0 +1,26 @@
+diff --git a/drivers/power/oplus_chg/oplus_charger.c b/drivers/power/oplus_chg/oplus_charger.c
+index 56dbb58..edba7b6 100644
+--- a/drivers/power/oplus_chg/oplus_charger.c
++++ b/drivers/power/oplus_chg/oplus_charger.c
+@@ -158,6 +158,10 @@ static int chgr_dbg_total_time = 0;
+ module_param(chgr_dbg_total_time, int, 0644);
+ MODULE_PARM_DESC(chgr_dbg_total_time, "debug charger total time");
+ 
++static bool disable_warp_probe = true;
++module_param(disable_warp_probe, bool, 0644);
++MODULE_PARM_DESC(disable_warp_probe, "Skip OPLUS WARP/VOOC D+/D- switch probing to keep USB Host NIC stable while charging");
++
+ /****************************************/
+ static int reset_mcu_delay = 0;
+ static bool suspend_charger = false;
+@@ -7503,6 +7507,10 @@ static void oplus_chg_fast_switch_check(struct oplus_chg_chip *chip)
+ 		charger_xlog_printk(CHG_LOG_CRTI, " mmi_chg,return\n");
+ 		return;
+ 	}
++	if (disable_warp_probe) {
++		charger_xlog_printk(CHG_LOG_CRTI, " disable_warp_probe,return\n");
++		return;
++	}
+ 	if (chip->allow_swtich_to_fastchg == false) {
+ 		charger_xlog_printk(CHG_LOG_CRTI, " allow_swtich_to_fastchg == 0,return\n");
+ 		return;

@@ -37,13 +37,13 @@ client:      2001:db8:1234:5678::2/64      (下级设备)
 
 ### 2.2 OpenWrt 容器
 
-实测结果：
+实测结果（2026-11-27 复验通过）：
 
-- PC 通过 USB 网卡获得运营商 `/64` 内的地址；
-- PC 可以 ping 容器 `eth0` 的 `::1`；
-- PC 可以 ping 外网 `2400:3200::1`；
+- PC（`以太网 3`，RTL8153 1 Gbps）通过 USB 网卡经 SLAAC/RA 自动获得运营商同 `/64` 地址；
+- PC 可 ping 通容器 `eth0` 的 `::1`；
+- PC 可 ping 通外网 `2400:3200::1`（日常热修后实测 **34–53 ms**、冷启动免手操验收实测 **44–48 ms**，均为 **0% 丢包**）；
 - 容器内 `odhcpd` 正常发 RA；
-- 没有配置任何 NAT66 规则。
+- 没有配置任何 NAT66 规则，也没有使用 ULA。
 
 ---
 
@@ -62,14 +62,14 @@ V6_NET      = <prefix>::/64
 V6_LAN_ADDR = <prefix>::1
 ```
 
-> 5G 接口不是固定的：脚本用 `ip route get 8.8.8.8` 找真正承载默认路由的 `rmnet_dataX`，不写死 `rmnet_data0/1/2`。
+> 5G 接口不是固定的：脚本先查 `ip route get 8.8.8.8`，若 Wi-Fi 是默认路由则通过 `find_rmnet_wan()`（`ip -4 route show table all`）查找真正持有 IPv4 默认路由的 `rmnet_dataX`，不写死 `rmnet_data0/1/2`。
 
 ### 3.2 容器侧
 
 ```text
 eth0:      <prefix>::1/64
 veth-owrt: fe80::2/64
-默认路由:  via fe80::1 dev veth-owrt
+默认路由:  default via fe80::1 dev veth-owrt onlink
 ```
 
 ### 3.3 宿主侧
@@ -78,13 +78,15 @@ veth-owrt: fe80::2/64
 veth-host: fe80::1/64
 
 table 200:
-  <prefix>::/64 dev veth-host
+  <prefix>::/64 via fe80::2 dev veth-host onlink
 
 ip -6 rule:
   1000: iif <rmnet> lookup 200
 ```
 
-作用：从 5G 进来的、目标地址属于 LAN `/64` 的包，转发到 `veth-host`，而不是又从 `rmnet` 发回去。
+作用：从 5G 进来的、目标地址属于 LAN `/64` 的回程包，经由容器侧 `veth-owrt` 的链路本地下一跳 `fe80::2` 转发到 `veth-host`，而不是又从 `rmnet` 发回去。
+
+> **关键修复（2026-11-27）**：旧版 `04` 写的是 `<prefix>::/64 dev veth-host`（无下一跳）。这样 Android 会把整个 `/64` 视为 `veth-host` 直连网段，在 `veth-host` 上直接对 LAN 客户端发 NDP 邻居解析并失败（因为客户端位于容器另一侧的 `eth0` 后方），导致 PC 外网 IPv6 100% 丢包。改为 `via fe80::2 dev veth-host onlink table 200` 后，回程流量由容器路由到 `eth0`，PC ping `2400:3200::1` 立即恢复 0% 丢包。
 
 如果 Wi-Fi 仍是默认路由、5G 不是默认，脚本还会尽力建立：
 
@@ -138,7 +140,7 @@ option ra_dns '1'
 1. **只处理 `/64`**：如果运营商给 `/56` / `/60`，脚本不会自动切前缀长度；
 2. **前缀变化不自动刷新**：5G 重拨后运营商可能换 `/64`，当前需要重跑 `04` 或重启手机；
 3. **没有 NDP proxy**：依赖运营商把整个 `/64` 路由到 UE；实测当前网络可用，但换运营商可能需要在 `rmnet` 上补 proxy NDP；
-4. **容器内没有 IPv6 防火墙**：`fw3` 未实际运行，IPv6 转发安全边界在宿主侧，默认没有做 LAN 隔离；
+4. **IPv6 公网暴露边界需自行审视**：容器内 `fw3`（`iptables-legacy`）已正常运行并由看门狗自愈（`Allow-Host-UI` 与 IPv4 `MASQUERADE` 均生效），但 LAN 客户端持有运营商公网 `/64` 地址且入口经由 Android 宿主转发，如需严格 IPv6 入站隔离请额外核查容器 `ip6tables` 规则；
 5. **热点客户端不共享**：Android 热点仍是独立网络，与容器 LAN 隔离。
 
 ---
@@ -150,6 +152,7 @@ option ra_dns '1'
 adb shell su -c "ip -6 addr show dev rmnet_dataX scope global"
 adb shell su -c "ip -6 rule | head"
 adb shell su -c "ip -6 route show table 200"
+# 期望包含：<prefix>::/64 via fe80::2 dev veth-host onlink
 
 # 容器
 P=$(cat /data/openwrt/run/container.pid)
@@ -163,5 +166,6 @@ $BB nsenter -t "$P" -m -u -n -p -- /system/bin/chroot /data/openwrt/rootfs /bin/
 
 # 客户端
 # Windows: ipconfig /all，确认拿到同 /64 地址
+# Windows: ping -6 2400:3200::1（实测 34-53 ms / 0% 丢包）
 # 浏览器: https://test-ipv6.com/
 ```

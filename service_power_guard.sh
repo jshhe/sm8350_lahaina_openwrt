@@ -16,4 +16,4 @@ if [ -f "$PIDFILE" ]; then
     fi
 fi
 
-nohup "$GUARD" >/dev/null 2>&1 &
+nohup /system/bin/sh "$GUARD" >/dev/null 2>&1 &

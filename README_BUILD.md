@@ -2,9 +2,9 @@
 
 本文档记录当前固件的完整落地流程：**自定义 KABI 安全内核 → 刷入 boot → 部署 OpenWrt 21.02.7 容器 → 网络/自启 → 验证**。
 
-> **当前基线（2026-10）**
+> **当前基线（2026-11-27）**
 > - Android：OOS 14 `LE2120_14.0.0.1901`
-> - 内核：`5.4.254-qgki-gd2a1055adeb0`，GitHub Actions build `40346641157`（run4）
+> - 内核：`5.4.254-qgki-gd2a1055adeb0`，当前手机在运行 GitHub Actions build `40346641157`（run4）；构建流程已新增 0-KABI 补丁 `fix_oplus_warp_probe.patch`（`disable_warp_probe=1`）
 > - KABI：1,607 / 1,607 符号 CRC 匹配
 > - OpenWrt：21.02.7 `armvirt/64`（`fw3` + `iptables-legacy`）
 > - 当前 boot：`artifacts/kernel_run4/new-boot-custom-v3.img`
@@ -105,8 +105,11 @@ CONFIG_OPLUS_FINGERPRINT*=y
 | 原生 IPv6 `/64` | ✅ | ✅ |
 | RTL8156 2.5G | ❌（旧 r8152） | ✅ 内置 v2.22.1 |
 | OPlus 指纹驱动 | ✅（旧命名） | ✅（`OPLUS_*` 命名） |
+| OPLUS WARP D+/D- 探测开关 | ❌（充电时易切 `switch1_gpio:1` 断网卡） | ✅（`fix_oplus_warp_probe.patch`，默认 `disable_warp_probe=1`，可运行时切换） |
 | `NF_TABLES` / `fw4` | ❌ | ❌ |
 | KABI 兼容原厂模块 | — | ✅ 1,607/1,607 |
+
+> **`fix_oplus_warp_probe.patch` 说明（0 KABI 变更）**：在 `drivers/power/oplus_chg/oplus_charger.c` 的 `oplus_chg_fast_switch_check()` 中增加模块参数 `/sys/module/oplus_chg/parameters/disable_warp_probe`（默认 `1`），跳过 OPLUS WARP/VOOC D+/D- 开关探测，避免带电扩展坞充电时硬件 mux `switch1_gpio:1` 抢占 D+/D- 导致 USB 网卡 `error -71` 掉线，同时完全保留普通 5V / USB-PD 充电。不改动任何结构体或导出符号（1,607 KABI CRC 保持 100% 一致）；直插原装快充头时可执行 `echo 0 > /sys/module/oplus_chg/parameters/disable_warp_probe` 运行时恢复。
 
 ---
 
@@ -118,7 +121,7 @@ GitHub Actions → **Build OnePlus 9 Pro 5.4 Kernel (OpenWrt + RTL8156B)** → *
 
 1. 下载 Clang `r383902b1` + GCC 4.9 工具链；
 2. 克隆 OnePlusOSS 内核与 `modules_and_devicetree`，覆盖 `vendor` / `techpack` / `device`；
-3. 用 `drivers/r8152/` 替换内核里的旧 `r8152.c`；
+3. 应用 `fix_oplus_warp_probe.patch`（0-KABI WARP 探测开关）并用 `drivers/r8152/` 替换内核里的旧 `r8152.c`；
 4. 以 `configs/stock_le2120_1901.config` 为基线，打开第 2 节的选项；
 5. 强制检查关键 `CONFIG_*`，缺一个就失败；
 6. 编译 `Image`；
@@ -258,8 +261,8 @@ adb shell su -c "mv /data/local/tmp/service_openwrt_autorun.sh /data/openwrt/scr
 adb shell su -c "mv /data/local/tmp/service_power_guard.sh /data/openwrt/scripts/"
 adb shell su -c "chmod 755 /data/openwrt/scripts/*.sh"
 
-# 3) 唯一 Magisk 入口
-adb shell su -c "printf '#!/system/bin/sh\nexec sh /data/openwrt/scripts/service_openwrt_autorun.sh\n' > /data/adb/service.d/00_openwrt.sh"
+# 3) 唯一 Magisk 入口（必须清掉 Magisk BusyBox ash 的 ASH_STANDALONE，交给 /system/bin/sh）
+adb shell su -c "printf '#!/system/bin/sh\nunset ASH_STANDALONE\nexec /system/bin/sh /data/openwrt/scripts/service_openwrt_autorun.sh\n' > /data/adb/service.d/00_openwrt.sh"
 adb shell su -c "chmod 755 /data/adb/service.d/00_openwrt.sh"
 ```
 
@@ -315,18 +318,21 @@ default via <5G网关> dev <rmnet>        # 5G 默认
 11. IPv6：
     - 从 `rmnet` 读取全局 `/64`；
     - 容器 `eth0` 配 `::1/64`；
-    - `veth-host` `fe80::1`，`veth-owrt` `fe80::2`，容器默认 `via fe80::1`；
-    - 宿主 table 200：`<prefix>/64 dev veth-host`；rule `iif <rmnet> lookup 200 pref 1000`；
+    - `veth-host` `fe80::1`，`veth-owrt` `fe80::2`，容器默认 `via fe80::1 dev veth-owrt onlink`；
+    - 宿主 table 200：`<prefix>/64 via fe80::2 dev veth-host onlink`（必须指定 `via fe80::2`，避免 Android 在 `veth-host` 上对 LAN 客户端发 NDP 解析失败）；rule `iif <rmnet> lookup 200 pref 1000`；
     - 宿主 table 201：5G IPv6 默认；rule `from <prefix> lookup 201 pref 1001`；
     - 容器内 `odhcpd` 发 RA，客户端 SLAAC。
+12. 在 `netifd` / IPv6 全部稳定后，于 `04` 末尾重启 `/etc/init.d/firewall` 并校验 `zone_wan_postrouting`（`MASQUERADE`）与 `zone_wan_input`（`Allow-Host-UI`），不完整则重试一次。
 
 补充的可靠性措施：
 
-- 启动前按 `/proc/<pid>/root` 清理整个容器进程树，避免失败启动泄漏 PID/netns；
+- **三层清除 Magisk `ASH_STANDALONE=1`**：`00_openwrt.sh`、`service_openwrt_autorun.sh`、`04_start_openwrt_and_network.sh` 入口均 `unset ASH_STANDALONE` 并重执 `/system/bin/sh`（mksh），防止 Magisk BusyBox ash 独立模式忽略 `PATH` 导致 BusyBox `ip`/`ps` 失效；
+- 启动前按 `/proc/<pid>/root` 清理整个容器进程树（若仍有 `procd` 残留则走全 `/proc` 回退清理），避免失败启动泄漏 PID/netns；
 - `04` 用目录锁串行化，autorun 与手动执行不会并发创建 veth；
+- 严格用 `pgrep -P "$UNSHARE_PID"`（回退 `ps -A -o PID,PPID`）定位新容器 init PID，绝不回退匹配任意 rootfs 进程；
 - veth 用 toybox `ip link add name ... peer name ...`，并校验 peer 存在；
-- 等 PID namespace init 真正出现后再写 `container.pid`；
-- 容器 init 完成后把 `/dev/rtc0` / `/dev/rtc` 覆盖成 `/dev/null`；
+- `ensure_usb_host_mode()` 严守 `mode=peripheral` 不碰 PC 数据线，仅在检测到带电 Type-C Host 扩展坞被 OPLUS 打回 `mode=none` 或 `mode=host` 无设备时暂关 `mmi_charging_enable` 恢复 Host 枚举；
+- 容器 init 与 reload 全部完成后把 `/dev/rtc0` / `/dev/rtc` 覆盖成 `/dev/null`；
 - 5G PDN 抖动时 `04` 重试 30 秒；autorun 等待 180 秒；
 - 找 5G 接口用 `ip -4 route show table all`，不依赖 Wi-Fi 可能占据的系统默认路由。
 
@@ -340,25 +346,27 @@ default via <5G网关> dev <rmnet>        # 5G 默认
 /data/adb/service.d/00_openwrt.sh
 ```
 
-内容只有一行：
+内容（必须先 `unset ASH_STANDALONE`，再由 `/system/bin/sh` 启动）：
 
 ```sh
 #!/system/bin/sh
-exec sh /data/openwrt/scripts/service_openwrt_autorun.sh
+unset ASH_STANDALONE
+exec /system/bin/sh /data/openwrt/scripts/service_openwrt_autorun.sh
 ```
 
 自启脚本会：
 
-1. 先启动电源守护（cpu7 离线、50–60% 停充）；
-2. 等 `sys.boot_completed=1`；
-3. 等 5G 默认路由（最多 120 秒）；
-4. 等 USB 网卡 `eth0`（最多 60 秒）；
-5. 容器没跑就执行 `04`；
+1. 先以 `/system/bin/sh` 启动电源守护（cpu7 离线、50–60% 停充）；
+2. 等 `sys.boot_completed=1`（最多 180 秒）；
+3. 通过 `find_rmnet_wan()` 等 5G 活跃路由（最多 180 秒）；
+4. 调用 `ensure_usb_host_mode()` 并等 USB 网卡（`eth0`/`usb0`/`eth1`，最多 30 秒）；
+5. 容器没跑就以 `/system/bin/sh` 执行 `04`；
 6. 每 30 秒看门狗：
-   - 重新确保 `ip_forward` / IPv6 forwarding；
-   - 重新确保 table 100、rule 90/100/101；
+   - `ensure_wan()`：重断言 `ip_forward` / IPv6 forwarding、table 100、rule 90/100/101，以及宿主 `iptables` `MASQUERADE` / `FORWARD` 规则；
+   - 电源守护挂了自动拉起；
    - 容器挂了自动重启；
-   - 电源守护挂了自动拉起。
+   - 若容器处于 WAN-only（`! container_has_lan`），调用 `ensure_usb_host_mode()` 恢复 USB Host，检测到 `host_has_lan` 时自动重跑 `04` 挂载热插拔/重插供电后的网卡；
+   - 容器与 LAN 正常时调用 `ensure_container_fw()` 检查 `zone_wan_postrouting`（`MASQUERADE`）与 `zone_wan_input`，缺失时自动重启容器 `firewall` 自愈。
 
 临时禁用自启（不删入口）：
 
@@ -393,7 +401,10 @@ adb shell su -c "cat /proc/sys/net/ipv4/ip_forward"          # 1
 adb shell su -c "ip rule | head -8"                          # 90/100/101
 adb shell su -c "ip route show table 100"                    # 5G default + veth link
 adb shell su -c "ip -6 rule | head -8"                       # pref 1000/1001
+adb shell su -c "ip -6 route show table 200"                 # via fe80::2 dev veth-host onlink
 adb shell su -c "iptables -t nat -S POSTROUTING | grep 10.200.1"
+adb shell su -c "cat /sys/devices/platform/soc/a600000.ssusb/mode"
+adb shell su -c "cat /sys/module/oplus_chg/parameters/disable_warp_probe" # 含 WARP 补丁内核期望 Y
 ```
 
 ### 7.2 容器
@@ -446,6 +457,10 @@ $BB nsenter -t "$P" -m -u -n -p -- /system/bin/chroot /data/openwrt/rootfs /bin/
 | `veth peer veth-owrt was not created` | 创建 veth 时 `ip` 解析到 BusyBox 或被并发 04 删除 | `04` 强制 toybox PATH；目录锁串行化；创建后校验 |
 | Wi-Fi 是默认路由时 autorun 一直等 5G / 04 选不到 WAN | `ip route get 8.8.8.8` 返回 `wlan0`，旧逻辑只认默认路由 | `find_rmnet_wan` 用 `ip -4 route show table all` 找 rmnet 默认；autorun 等 180 秒；`04` 重试 30 秒 |
 | 容器内 `date` 与宿主不一致 | 容器曾执行 `hwclock -s` / NTP | 容器禁用时间服务并隐藏 RTC；Android `auto_time=1`、`ntp_server=ntp.aliyun.com` |
+| Magisk `service.d` 下 `veth-owrt` 反复创建失败且每 30 秒泄漏容器 | Magisk 在 BusyBox ash `ASH_STANDALONE=1` 模式运行脚本（忽略 `PATH`），BusyBox `ip` 建不出命名 peer、BusyBox `ps` 无 `-A -o` | `00_openwrt.sh`、`service_openwrt_autorun.sh`、`04` 三层 `unset ASH_STANDALONE` + `exec /system/bin/sh`，并改用 `pgrep -P` 严格匹配容器 init PID |
+| PC 原生 IPv6 ping 外网 100% 丢包 | 宿主 `table 200` 原为 `<prefix>/64 dev veth-host`，Android 在 `veth-host` 上对 LAN 客户端发 NDP 解析失败 | 改为 `via fe80::2 dev veth-host onlink table 200`；PC ping `2400:3200::1` 34–53 ms、0% 丢包 |
+| 容器冷启动后 `fw3` 规则为空（手机打不开 LuCI 或 LAN 无 NAT） | `04` 启动时与 `procd`/`S19firewall` 及异步 `netifd reload` 竞态 | 将 `/etc/init.d/firewall restart` 移至 `04` 末尾并校验重试；30 秒看门狗增加 `ensure_container_fw()` 自动自愈 |
+| 带电扩展坞重插/充电时 USB 网卡掉线或 `error -71` | VBUS 触发 `oplus_otg_disable_work` 将 dwc3 打回 `mode=none`；充电时 OPLUS `oplus_chg_fast_switch_check()` 翻转 `switch1_gpio:1`（WARP）抢占 D+/D- | 用户态新增 `ensure_usb_host_mode()`（严守 `mode=peripheral`）+ 热挂看门狗（30–60 秒自愈）；内核新增 0-KABI 补丁 `fix_oplus_warp_probe.patch`（`disable_warp_probe=1`） |
 
 更完整的测试记录见 **[`TEST_REPORT.md`](TEST_REPORT.md)**。
 

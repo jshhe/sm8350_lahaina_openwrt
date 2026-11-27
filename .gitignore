@@ -24,6 +24,7 @@ artifacts/
 
 # Personal notes and exports
 turn_*.txt
+session-*.md
 *.json
 !configs/phone_kabi_crc.json
 
