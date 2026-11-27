@@ -142,25 +142,38 @@ cleanup_old_container() {
 
 # Return 0 if xhci buses 2/3 currently have any enumerated USB child device.
 usb_host_has_devices() {
-    for d in /sys/bus/usb/devices/2-[0-9]* /sys/bus/usb/devices/3-[0-9]*; do
+    for d in /sys/bus/usb/devices/2-[1-9]* /sys/bus/usb/devices/3-[1-9]*; do
         [ -f "$d/idVendor" ] && return 0
     done
     return 1
 }
 
-# Recover USB host mode when a powered Type-C hub/dock is attached.
+# Return 0 if xhci bus 3 (USB 3.0 SuperSpeed) has an enumerated child device.
+usb_host_has_usb3() {
+    for d in /sys/bus/usb/devices/3-[1-9]*; do
+        [ -f "$d/idVendor" ] && return 0
+    done
+    return 1
+}
+
+# Recover USB host mode (preferring USB 3.0 SuperSpeed 5 Gbps via lane A/B
+# orientation override) when a powered Type-C hub/dock is attached.
 # On OPLUS/OOS 14:
-#   1) VBUS from a PD hub triggers oplus_chg to disable otg_switch and drop
-#      dwc3 back to mode=none even though Type-C negotiated data_role=[host].
-#   2) While charging is enabled (mmi_charging_enable=1), oplus_chg's WARP
-#      detection flips switch1_gpio=1 and hijacks USB D+/D-, causing error -71
-#      and leaving mode=host with zero enumerated devices.
+#   1) A powered non-PD dock can leave dwc3 in mode=none with data_role=[host]
+#      or data_role=[device] + usb/type=USB_DCP.
+#   2) Manually forcing mode=host without a Type-C polarity event leaves
+#      ss_phy without PHY_LANE_A/B, downgrading the NIC to USB 2.0 (480 Mbps).
+#      Probing orientation A/B restores USB 3.0 SuperSpeed (5000 Mbps) while
+#      keeping power_role=[sink] charging active.
 # Guard strictly so a PC USB connection (mode=peripheral) is never touched.
 ensure_usb_host_mode() {
     mode_f="/sys/devices/platform/soc/a600000.ssusb/mode"
+    orient_f="/sys/devices/platform/soc/a600000.ssusb/orientation"
     otg_sw="/sys/class/oplus_chg/usb/otg_switch"
     otg_on="/sys/class/oplus_chg/usb/otg_online"
     role_f="/sys/class/typec/port0/data_role"
+    usb_type_f="/sys/class/power_supply/usb/type"
+    warp_dis_f="/sys/module/oplus_chg/parameters/disable_warp_probe"
     mmi_f="/sys/class/oplus_chg/battery/mmi_charging_enable"
     cap_f="/sys/class/oplus_chg/battery/capacity"
 
@@ -180,46 +193,73 @@ ensure_usb_host_mode() {
 
     online=$(cat "$otg_on" 2>/dev/null)
     role=$(cat "$role_f" 2>/dev/null)
+    utype=$(cat "$usb_type_f" 2>/dev/null)
     case "$online" in
         ''|0) return 0 ;;
     esac
+    trigger=0
     case "$role" in
-        *'[host]'*)
-            log "Type-C host dock detected (mode=$mode, otg_online=$online, no USB NIC); recovering host mode"
-            old_mmi=$(cat "$mmi_f" 2>/dev/null)
-            # Pause charging during enumeration so oplus_chg_fast_switch_check
-            # returns immediately instead of flipping switch1_gpio=1 (WARP D+/D- mux).
-            if [ "$old_mmi" = "1" ] && [ -w "$mmi_f" ]; then
-                echo 0 > "$mmi_f" 2>/dev/null
-                sleep 1
-            fi
-            if [ "$mode" = "host" ]; then
-                echo none > "$mode_f" 2>/dev/null
-                sleep 2
-            fi
-            echo 1 > "$otg_sw" 2>/dev/null
-            echo host > "$mode_f" 2>/dev/null || return 0
-            k=0
-            while [ $k -lt 6 ]; do
-                for iface in "$LAN_IF" eth0 usb0 eth1; do
-                    if ip link show "$iface" >/dev/null 2>&1; then
-                        # Only re-enable charging if battery is at/below resume floor (50%).
-                        soc=$(cat "$cap_f" 2>/dev/null)
-                        if [ "$old_mmi" = "1" ] && [ -n "$soc" ] && [ "$soc" -le 50 ] 2>/dev/null; then
-                            echo 1 > "$mmi_f" 2>/dev/null
-                        fi
-                        return 0
-                    fi
-                done
-                sleep 1
-                k=$((k+1))
-            done
-            soc=$(cat "$cap_f" 2>/dev/null)
-            if [ "$old_mmi" = "1" ] && [ -n "$soc" ] && [ "$soc" -le 50 ] 2>/dev/null; then
-                echo 1 > "$mmi_f" 2>/dev/null
-            fi
-            ;;
+        *'[host]'*) trigger=1 ;;
     esac
+    [ "$utype" = "USB_DCP" ] && trigger=1
+    [ "$trigger" = "1" ] || return 0
+
+    log "Type-C dock detected (mode=$mode, otg_online=$online, role=$role, usb_type=$utype); recovering USB 3.0 host mode"
+    old_mmi=$(cat "$mmi_f" 2>/dev/null)
+    warp_dis=$(cat "$warp_dis_f" 2>/dev/null)
+    if [ "$warp_dis" != "Y" ] && [ "$old_mmi" = "1" ] && [ -w "$mmi_f" ]; then
+        echo 0 > "$mmi_f" 2>/dev/null
+        sleep 1
+    fi
+
+    found_lan=0
+    orient_cache="$RUN_DIR/usb3_orient"
+    cached_o=$(cat "$orient_cache" 2>/dev/null)
+    case "$cached_o" in
+        B) try_list="B A" ;;
+        *) try_list="A B" ;;
+    esac
+    cur_m="$mode"
+    for try_o in $try_list; do
+        if [ "$cur_m" != "none" ]; then
+            echo none > "$mode_f" 2>/dev/null
+            sleep 2
+        fi
+        [ -w "$orient_f" ] && echo "$try_o" > "$orient_f" 2>/dev/null
+        echo 1 > "$otg_sw" 2>/dev/null
+        echo host > "$mode_f" 2>/dev/null || break
+        cur_m="host"
+        k=0
+        while [ $k -lt 5 ]; do
+            for iface in "$LAN_IF" eth0 usb0 eth1; do
+                if ip link show "$iface" >/dev/null 2>&1; then
+                    found_lan=1
+                    break
+                fi
+            done
+            if [ "$found_lan" = "1" ]; then
+                if usb_host_has_usb3; then
+                    echo "$try_o" > "$orient_cache" 2>/dev/null
+                    log "USB 3.0 SuperSpeed active (orientation=$try_o)"
+                    break 2
+                fi
+                # Try the alternate lane next to see if USB 3.0 is on the other side.
+                break
+            fi
+            sleep 1
+            k=$((k+1))
+        done
+    done
+
+    if [ "$found_lan" != "1" ]; then
+        # Plain charger without USB hub/NIC: restore idle state cleanly.
+        echo none > "$mode_f" 2>/dev/null
+        [ -w "$orient_f" ] && echo none > "$orient_f" 2>/dev/null
+    fi
+    if [ "$warp_dis" != "Y" ] && [ "$old_mmi" = "1" ]; then
+        soc=$(cat "$cap_f" 2>/dev/null)
+        [ -n "$soc" ] && [ "$soc" -le 50 ] 2>/dev/null && echo 1 > "$mmi_f" 2>/dev/null
+    fi
 }
 
 cleanup_on_exit() {
