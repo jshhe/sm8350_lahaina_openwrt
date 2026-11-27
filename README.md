@@ -56,11 +56,12 @@ Android 宿主 + namespace/chroot 容器 + USB 网卡 netns 直通 + 5G 宿主 N
 | Android | OOS 14 `LE2120_14.0.0.1901` |
 | Bootloader | 已解锁 |
 | AVB / dm-verity | A 槽已关闭，`vbmeta_a` flags = `0x3` |
-| Root | Magisk 30.7 |
-| 内核 | Linux `5.4.254-qgki-gd2a1055adeb0`（自定义，GitHub Actions run4，build `40346641157`） |
+| Root | Magisk 31.1 (`31.1:MAGISK:R`) |
+| 内核 | Linux `5.4.254-qgki-gd2a1055adeb0`（自定义，GitHub Actions run6，build `45950059781`，含 `disable_warp_probe=Y`） |
 | KABI | **1,607 / 1,607** 导出符号 CRC 与原厂 99 个 `.ko` 完全匹配 |
-| `Image` | 48,421,376 字节，SHA256 `732343e0…194ff09b` |
-| 当前 boot | `artifacts/kernel_run4/new-boot-custom-v3.img`，SHA256 `3c6de08d…48335141` |
+| `Image` | 48,421,376 字节，SHA256 `aa9bcca8…97a8575` |
+| 当前 boot | `artifacts/kernel_run6/new-boot-custom-v4-magisk31.1.img`，SHA256 `eadf3cf3…ed1b73d7` |
+| 上一版备份 boot | `magisk_patch/boot_a_backup_run4_magisk31.1.img`，SHA256 `88d6088f…cd7f216` |
 | 原厂 Root 回滚 boot | `magisk_patch/magisk_patched_boot_v30.7.img`，SHA256 `a7fb4a0a…0161b4d3d` |
 | OpenWrt | 21.02.7 `armvirt/64`，`fw3` + `iptables-legacy` |
 | 容器形式 | `unshare -m -u -n -p -f` + `chroot`，`procd` 是容器内 PID 1 |

@@ -3,11 +3,11 @@
 本文档记录当前固件的完整落地流程：**自定义 KABI 安全内核 → 刷入 boot → 部署 OpenWrt 21.02.7 容器 → 网络/自启 → 验证**。
 
 > **当前基线（2026-11-27）**
-> - Android：OOS 14 `LE2120_14.0.0.1901`
-> - 内核：`5.4.254-qgki-gd2a1055adeb0`，当前手机在运行 GitHub Actions build `40346641157`（run4）；构建流程已新增 0-KABI 补丁 `fix_oplus_warp_probe.patch`（`disable_warp_probe=1`）
+> - Android：OOS 14 `LE2120_14.0.0.1901`，Magisk 31.1
+> - 内核：`5.4.254-qgki-gd2a1055adeb0`，GitHub Actions build `45950059781`（run6），已合入 0-KABI 补丁 `fix_oplus_warp_probe.patch`（`/sys/module/oplus_chg/parameters/disable_warp_probe=Y`）
 > - KABI：1,607 / 1,607 符号 CRC 匹配
 > - OpenWrt：21.02.7 `armvirt/64`（`fw3` + `iptables-legacy`）
-> - 当前 boot：`artifacts/kernel_run4/new-boot-custom-v3.img`
+> - 当前 boot：`artifacts/kernel_run6/new-boot-custom-v4-magisk31.1.img`（SHA256 `eadf3cf3…ed1b73d7`）
 >
 > 旧的“原厂内核 + r8152 Magisk 模块”路线仅作为**零刷机兜底/回滚参考**，不再是主路线。
 
@@ -162,12 +162,12 @@ AnyKernel3 会：
 
 ### 4.2 直接 fastboot 刷完整 boot
 
-如果已经有打包好的 `new-boot-custom-v3.img`（Magisk ramdisk + 自定义内核）：
+如果已经有打包好的 `new-boot-custom-v4-magisk31.1.img`（Magisk ramdisk + 自定义内核）：
 
 ```powershell
 $fb = ".tmp\platform-tools-34\platform-tools\fastboot.exe"
 & $fb getvar current-slot
-& $fb flash boot_a artifacts\kernel_run4\new-boot-custom-v3.img
+& $fb flash boot_a artifacts\kernel_run6\new-boot-custom-v4-magisk31.1.img
 & $fb reboot
 ```
 
@@ -488,7 +488,7 @@ Android OTA 会覆盖 `boot`（自定义内核丢失）和 `vbmeta_a`（AVB 重�
 
 1. 从新固件解包 `vendor_dlkm` / `vendor_boot` 里的 `.ko`；
 2. 解析每个 `.ko` 的 `__versions`，生成新的 CRC 表；
-3. 与当前 `artifacts/kernel_run4/Module.symvers` 对比；
+3. 与当前 `artifacts/kernel_run6/Module.symvers` 对比；
 4. 结果：
    - **1,607 个符号全部匹配** → 直接用现有 `Image` 重新打包 Magisk boot，刷 `boot_a`，**不用重编**；
    - **任意不匹配** → 必须按新固件源码重编内核，并重新跑 KABI 闸门。

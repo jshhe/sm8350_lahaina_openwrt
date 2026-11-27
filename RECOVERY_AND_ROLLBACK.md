@@ -32,11 +32,10 @@
 
 | 文件 | 内容 | SHA256 |
 | :--- | :--- | :--- |
-| `artifacts/kernel_run4/new-boot-custom-v3.img` | Magisk ramdisk + 自定义内核 | `3c6de08d0e90cbf02d9a2ef8598a1969742ef98a48ebe479be25206848335141` |
-| `magisk_patch/magisk_patched_boot_v30.7.img` | 原厂内核 + Magisk 30.7（回滚基准） | `a7fb4a0a65508861cbb235ada0f1e75fca9e23840a0da88a8f6799e0161b4d3d` |
+| `artifacts/kernel_run6/new-boot-custom-v4-magisk31.1.img` | Magisk 31.1 ramdisk + 自定义内核 run6（含 `disable_warp_probe`） | `eadf3cf37bde2ea5402756eef01d68290be809d0d84bfd480a88fd22ed1b73d7` |
+| `magisk_patch/boot_a_backup_run4_magisk31.1.img` | Magisk 31.1 + 自定义内核 run4（刷 run6 前备份） | `88d6088facbd237f83e0e627ae978dbbff08db43114336145e11d3b12cd7f216` |
+| `magisk_patch/magisk_patched_boot_v30.7.img` | 原厂内核 + Magisk 30.7（原厂回滚基准） | `a7fb4a0a65508861cbb235ada0f1e75fca9e23840a0da88a8f6799e0161b4d3d` |
 | `firmware_LE2120_14.0.0.1901/boot.img` | 官方原厂 boot（未 Root） | 见官方包 |
-
-> `magisk_patch/boot_a_current.img` 与 `magisk_patched_boot_v30.7.img` 当前内容相同，都是回滚基准。
 
 ### 1.3 快速工具
 
@@ -164,7 +163,7 @@ $fb = ".tmp\platform-tools-34\platform-tools\fastboot.exe"
 ### 3.3 恢复自定义内核
 
 ```powershell
-& $fb flash boot_a artifacts\kernel_run4\new-boot-custom-v3.img
+& $fb flash boot_a artifacts\kernel_run6\new-boot-custom-v4-magisk31.1.img
 & $fb reboot
 ```
 

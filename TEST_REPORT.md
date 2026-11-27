@@ -52,17 +52,19 @@
 | :--- | :--- | :--- |
 | run2 | `artifacts/kernel_run2/` | 早期打通编译链路，保留作对照 |
 | run3 | `artifacts/kernel_run3/` | 加入 `Module.symvers`，继续修配置 |
-| **run4** | `artifacts/kernel_run4/` | **最终版本**：KABI 100%，指纹/2.5G/PID_NS 全部就绪 |
+| run4 | `artifacts/kernel_run4/`（已归档移除） | 首个全功能版：KABI 100%，指纹/2.5G/PID_NS 就绪 |
+| **run6** | `artifacts/kernel_run6/` | **当前在网版本**：在 run4 基础上合入 `fix_oplus_warp_probe.patch`（0-KABI），实测 `disable_warp_probe=Y` 零 `switch1_gpio:1`、USB 3.0 5000 Mbps 与 `sink` 供电共存、5s 看门狗 + 原地热挂 11s 恢复 |
 
-run4 关键数据：
+run6 关键数据：
 
 ```text
-build:        40346641157
-uname -v:     #1 SMP PREEMPT Mon Oct 26 15:30:13 UTC 2026
+build:        45950059781
+uname -v:     #1 SMP PREEMPT Fri Nov 27 06:15:42 UTC 2026
 Image:        48,421,376 bytes
-SHA256:       732343e064af440ed32edc0c07098bcdb9fde69a12b6056a5128a141194ff09b
-boot image:   new-boot-custom-v3.img (201,326,592 bytes)
-boot SHA256:  3c6de08d0e90cbf02d9a2ef8598a1969742ef98a48ebe479be25206848335141
+SHA256:       aa9bcca8f875851778b371b28ed4bac5f0f1ce94f0cee0ef201f33c3f97a8575
+boot image:   new-boot-custom-v4-magisk31.1.img (201,326,592 bytes)
+boot SHA256:  eadf3cf37bde2ea5402756eef01d68290be809d0d84bfd480a88fd22ed1b73d7
+```
 ```
 
 ### 2.2 KABI 校验
