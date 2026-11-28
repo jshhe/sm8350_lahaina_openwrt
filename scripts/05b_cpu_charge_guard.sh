@@ -20,11 +20,15 @@ P0=/sys/devices/system/cpu/cpufreq/policy0/scaling_max_freq
 P4=/sys/devices/system/cpu/cpufreq/policy4/scaling_max_freq
 CAP=/sys/class/oplus_chg/battery/capacity
 MMI=/sys/class/oplus_chg/battery/mmi_charging_enable
+USB_ONLINE=/sys/class/power_supply/usb/online
+POWER_ROLE=/sys/class/typec/port0/power_role
 
 STOP_SOC=${STOP_SOC:-60}
 RESUME_SOC=${RESUME_SOC:-50}
+LOW_SOC_WARN=${LOW_SOC_WARN:-20}
 P0_MAX=${P0_MAX:-1324800}
 P4_MAX=${P4_MAX:-1440000}
+LAST_LOW_WARN_SOC=""
 
 log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
 
@@ -74,6 +78,32 @@ apply() {
         else
             log "soc=$soc resume FAILED (stop_voter/full)"
         fi
+    fi
+
+    # Rate-limited diagnostic alert when battery drains low without USB power
+    # (e.g. non-PD dock stuck in power_role=[source] after reboot, or unplugged).
+    if [ "$soc" -le "$LOW_SOC_WARN" ]; then
+        uon=$(cat "$USB_ONLINE" 2>/dev/null)
+        if [ "$uon" = "0" ] || [ -z "$uon" ]; then
+            if [ "$(cat "$MMI" 2>/dev/null)" != "1" ]; then
+                echo 1 > "$MMI" 2>/dev/null
+            fi
+            do_warn=0
+            if [ -z "$LAST_LOW_WARN_SOC" ]; then
+                do_warn=1
+            elif [ "$soc" -le $((LAST_LOW_WARN_SOC - 5)) ]; then
+                do_warn=1
+            fi
+            if [ "$do_warn" = "1" ]; then
+                prole=$(cat "$POWER_ROLE" 2>/dev/null)
+                log "WARN: low battery soc=${soc}% usb_online=${uon:-?} power_role=${prole:-?} mmi=$(cat "$MMI" 2>/dev/null)"
+                LAST_LOW_WARN_SOC="$soc"
+            fi
+        else
+            LAST_LOW_WARN_SOC=""
+        fi
+    else
+        LAST_LOW_WARN_SOC=""
     fi
 }
 

@@ -47,21 +47,22 @@ log() { echo "[$(date +%H:%M:%S)] $*"; }
 # Find the active 5G interface.  The system default route may be Wi-Fi, so check
 # each rmnet interface for an IPv4 address and its own default table.
 find_rmnet_wan() {
-    # Find the first IPv4 default route whose device is an rmnet interface.
+    # Find the first IPv4 default route whose device is an rmnet (or CLAT v4-rmnet) interface.
     # This is more reliable than probing per-interface tables, which can be
     # temporarily empty while Android reconnects the PDN.
     dev=$(ip -4 route show table all 2>/dev/null | awk '/^default/ {
         d="";
         for (i=1;i<=NF;i++) if ($i=="dev") { d=$(i+1); break }
-        if (d ~ /^rmnet/) { print d; exit }
+        if (d ~ /^rmnet/ || d ~ /^v4-rmnet/) { print d; exit }
     }')
     if [ -n "$dev" ]; then
         echo "$dev"
         return 0
     fi
-    for iface in rmnet_data0 rmnet_data1 rmnet_data2 rmnet_data3 rmnet_data4 rmnet_data5 rmnet0 v4-rmnet_data0; do
+    for iface in rmnet_data0 rmnet_data1 rmnet_data2 rmnet_data3 rmnet_data4 rmnet_data5 rmnet0 v4-rmnet_data0 v4-rmnet_data1 v4-rmnet_data2 v4-rmnet_data3 v4-rmnet_data4 v4-rmnet_data5; do
         ip -4 addr show "$iface" 2>/dev/null | grep -q 'inet ' || continue
-        ip route show table "$iface" 2>/dev/null | grep -q '^default' || continue
+        tbl="${iface#v4-}"
+        ip route show table "$tbl" 2>/dev/null | grep -q '^default' || ip route show table "$iface" 2>/dev/null | grep -q '^default' || continue
         echo "$iface"
         return 0
     done
@@ -140,18 +141,37 @@ cleanup_old_container() {
     done
 }
 
-# Return 0 if xhci buses 2/3 currently have any enumerated USB child device.
-usb_host_has_devices() {
-    for d in /sys/bus/usb/devices/2-[1-9]* /sys/bus/usb/devices/3-[1-9]*; do
-        [ -f "$d/idVendor" ] && return 0
+host_has_lan() {
+    for iface in "$LAN_IF" eth0 usb0 eth1; do
+        ip link show "$iface" >/dev/null 2>&1 && return 0
     done
     return 1
 }
 
-# Return 0 if xhci bus 3 (USB 3.0 SuperSpeed) has an enumerated child device.
+# Return 0 if xhci buses 2/3 currently have any enumerated non-hub USB device.
+# Ignore Linux root hubs (1d6b) and hub class devices (bDeviceClass=09) so an
+# empty dock hub cannot mask a missing/unenumerated USB NIC.
+usb_host_has_devices() {
+    for d in /sys/bus/usb/devices/2-[1-9]* /sys/bus/usb/devices/3-[1-9]*; do
+        [ -f "$d/idVendor" ] || continue
+        vid=$(cat "$d/idVendor" 2>/dev/null)
+        cls=$(cat "$d/bDeviceClass" 2>/dev/null)
+        [ "$vid" = "1d6b" ] && continue
+        [ "$cls" = "09" ] && continue
+        return 0
+    done
+    return 1
+}
+
+# Return 0 if xhci bus 3 (USB 3.0 SuperSpeed) has an enumerated non-hub USB device.
 usb_host_has_usb3() {
     for d in /sys/bus/usb/devices/3-[1-9]*; do
-        [ -f "$d/idVendor" ] && return 0
+        [ -f "$d/idVendor" ] || continue
+        vid=$(cat "$d/idVendor" 2>/dev/null)
+        cls=$(cat "$d/bDeviceClass" 2>/dev/null)
+        [ "$vid" = "1d6b" ] && continue
+        [ "$cls" = "09" ] && continue
+        return 0
     done
     return 1
 }
@@ -167,6 +187,7 @@ usb_host_has_usb3() {
 #      keeping power_role=[sink] charging active.
 # Guard strictly so a PC USB connection (mode=peripheral) is never touched.
 ensure_usb_host_mode() {
+    host_has_lan && return 0
     mode_f="/sys/devices/platform/soc/a600000.ssusb/mode"
     orient_f="/sys/devices/platform/soc/a600000.ssusb/orientation"
     otg_sw="/sys/class/oplus_chg/usb/otg_switch"
@@ -189,6 +210,11 @@ ensure_usb_host_mode() {
 
     if [ -w "$otg_sw" ] && [ "$(cat "$otg_sw" 2>/dev/null)" != "1" ]; then
         echo 1 > "$otg_sw" 2>/dev/null
+        # Wait briefly for oplus_chg workqueue to settle otg_online after 0->1 toggle.
+        online=$(cat "$otg_on" 2>/dev/null)
+        case "$online" in
+            ''|0) sleep 1 ;;
+        esac
     fi
 
     online=$(cat "$otg_on" 2>/dev/null)
@@ -213,6 +239,7 @@ ensure_usb_host_mode() {
     fi
 
     found_lan=0
+    usb2_fallback_orient=""
     orient_cache="$RUN_DIR/usb3_orient"
     cached_o=$(cat "$orient_cache" 2>/dev/null)
     case "$cached_o" in
@@ -221,6 +248,7 @@ ensure_usb_host_mode() {
     esac
     cur_m="$mode"
     for try_o in $try_list; do
+        found_lan=0
         if [ "$cur_m" != "none" ]; then
             echo none > "$mode_f" 2>/dev/null
             sleep 2
@@ -231,18 +259,14 @@ ensure_usb_host_mode() {
         cur_m="host"
         k=0
         while [ $k -lt 5 ]; do
-            for iface in "$LAN_IF" eth0 usb0 eth1; do
-                if ip link show "$iface" >/dev/null 2>&1; then
-                    found_lan=1
-                    break
-                fi
-            done
-            if [ "$found_lan" = "1" ]; then
+            if host_has_lan; then
+                found_lan=1
                 if usb_host_has_usb3; then
                     echo "$try_o" > "$orient_cache" 2>/dev/null
                     log "USB 3.0 SuperSpeed active (orientation=$try_o)"
                     break 2
                 fi
+                usb2_fallback_orient="$try_o"
                 # Try the alternate lane next to see if USB 3.0 is on the other side.
                 break
             fi
@@ -250,6 +274,25 @@ ensure_usb_host_mode() {
             k=$((k+1))
         done
     done
+
+    if [ "$found_lan" != "1" ] && [ -n "$usb2_fallback_orient" ]; then
+        log "alternate lane failed; restoring USB 2.0 fallback (orientation=$usb2_fallback_orient)"
+        echo none > "$mode_f" 2>/dev/null
+        sleep 2
+        [ -w "$orient_f" ] && echo "$usb2_fallback_orient" > "$orient_f" 2>/dev/null
+        echo 1 > "$otg_sw" 2>/dev/null
+        if echo host > "$mode_f" 2>/dev/null; then
+            k=0
+            while [ $k -lt 5 ]; do
+                if host_has_lan; then
+                    found_lan=1
+                    break
+                fi
+                sleep 1
+                k=$((k+1))
+            done
+        fi
+    fi
 
     if [ "$found_lan" != "1" ]; then
         # Plain charger without USB hub/NIC: restore idle state cleanly.
@@ -264,6 +307,7 @@ ensure_usb_host_mode() {
 
 cleanup_on_exit() {
     status=$?
+    trap - EXIT INT TERM HUP
     if [ "$status" -ne 0 ] && [ "$CONTAINER_STARTED" = "1" ]; then
         log "ERROR: container startup failed; cleaning up leaked processes"
         kill_container_tree TERM
@@ -273,7 +317,12 @@ cleanup_on_exit() {
     fi
     [ "$LOCK_HELD" = "1" ] && rm -rf "$LOCK_DIR"
 }
+# Convert termination signals into non-zero exit so cleanup_on_exit runs once
+# and the script cannot resume past an interrupted sleep without holding the lock.
 trap cleanup_on_exit EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 [ -d "$ROOTFS" ] || { log "ERROR: $ROOTFS not found; run 03_setup_openwrt_rootfs.sh first"; exit 1; }
 mkdir -p "$STATE_DIR" "$RUN_DIR" "$LOG_DIR"
@@ -283,8 +332,16 @@ mkdir -p "$STATE_DIR" "$RUN_DIR" "$LOG_DIR"
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
     old=$(cat "$LOCK_DIR/pid" 2>/dev/null)
     if [ -n "$old" ] && [ -d "/proc/$old" ] && [ "$old" != "$$" ]; then
-        log "another 04 instance is running (pid $old); exiting"
-        exit 0
+        # Lock directories survive sudden reboots while PIDs get reused:
+        # verify the PID actually belongs to 04_start_openwrt_and_network.sh.
+        cmd=$(tr '\0' ' ' < "/proc/$old/cmdline" 2>/dev/null)
+        case "$cmd" in
+            *04_start_openwrt_and_network*)
+                log "another 04 instance is running (pid $old); exiting"
+                exit 0
+                ;;
+        esac
+        log "removing stale 04 lock (pid $old is not 04)"
     fi
     rm -rf "$LOCK_DIR"
     mkdir "$LOCK_DIR" 2>/dev/null || { log "ERROR: cannot acquire 04 lock"; exit 1; }

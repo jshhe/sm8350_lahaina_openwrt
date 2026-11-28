@@ -30,9 +30,39 @@ export PATH=/system/bin:/system/xbin:$PATH
 BB=/data/adb/magisk/busybox
 LOG=/data/openwrt/logs/autorun.log
 PIDFILE=/data/openwrt/run/container.pid
+AUTORUN_PIDFILE=/data/openwrt/run/autorun.pid
+DISABLE_FLAG=/data/openwrt/disable_autorun
 mkdir -p /data/openwrt/logs /data/openwrt/run
 
 log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
+
+# Singleton guard: prevent duplicate autorun daemons from racing on USB/netns.
+# PID files survive reboots while PIDs get reused, so verify /proc/<pid>/cmdline.
+if [ -f "$AUTORUN_PIDFILE" ]; then
+    old=$(cat "$AUTORUN_PIDFILE" 2>/dev/null)
+    if [ -n "$old" ] && [ "$old" != "$$" ] && [ -d "/proc/$old" ]; then
+        cmd=$(tr '\0' ' ' < "/proc/$old/cmdline" 2>/dev/null)
+        case "$cmd" in
+            *service_openwrt_autorun*)
+                log "another service_openwrt_autorun instance is running (pid $old); exiting"
+                exit 0
+                ;;
+        esac
+    fi
+fi
+echo $$ > "$AUTORUN_PIDFILE"
+cleanup_autorun() {
+    trap - EXIT INT TERM HUP
+    if [ "$(cat "$AUTORUN_PIDFILE" 2>/dev/null)" = "$$" ]; then
+        rm -f "$AUTORUN_PIDFILE"
+    fi
+}
+trap cleanup_autorun EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+log "autorun started pid=$$ boot_completed=$(getprop sys.boot_completed 2>/dev/null)"
 
 container_running() {
     [ -f "$PIDFILE" ] || return 1
@@ -70,16 +100,30 @@ host_has_lan() {
     return 1
 }
 
+# Return 0 if xhci buses 2/3 have any enumerated non-hub USB device.
+# Ignore Linux root hubs (1d6b) and hub class devices (bDeviceClass=09) so an
+# empty dock hub cannot mask a missing/unenumerated USB NIC.
 usb_host_has_devices() {
     for d in /sys/bus/usb/devices/2-[1-9]* /sys/bus/usb/devices/3-[1-9]*; do
-        [ -f "$d/idVendor" ] && return 0
+        [ -f "$d/idVendor" ] || continue
+        vid=$(cat "$d/idVendor" 2>/dev/null)
+        cls=$(cat "$d/bDeviceClass" 2>/dev/null)
+        [ "$vid" = "1d6b" ] && continue
+        [ "$cls" = "09" ] && continue
+        return 0
     done
     return 1
 }
 
+# Return 0 if xhci bus 3 (USB 3.0 SuperSpeed) has an enumerated non-hub USB device.
 usb_host_has_usb3() {
     for d in /sys/bus/usb/devices/3-[1-9]*; do
-        [ -f "$d/idVendor" ] && return 0
+        [ -f "$d/idVendor" ] || continue
+        vid=$(cat "$d/idVendor" 2>/dev/null)
+        cls=$(cat "$d/bDeviceClass" 2>/dev/null)
+        [ "$vid" = "1d6b" ] && continue
+        [ "$cls" = "09" ] && continue
+        return 0
     done
     return 1
 }
@@ -91,6 +135,7 @@ USB_LAST_SIG=""
 # orientation override) when a powered Type-C hub/dock is attached.
 # Never touches mode=peripheral (wired PC USB cable).
 ensure_usb_host_mode() {
+    probe_phase="${1:-watchdog}"
     host_has_lan && return 0
     mode_f="/sys/devices/platform/soc/a600000.ssusb/mode"
     orient_f="/sys/devices/platform/soc/a600000.ssusb/orientation"
@@ -117,6 +162,11 @@ ensure_usb_host_mode() {
 
     if [ -w "$otg_sw" ] && [ "$(cat "$otg_sw" 2>/dev/null)" != "1" ]; then
         echo 1 > "$otg_sw" 2>/dev/null
+        # Wait briefly for oplus_chg workqueue to settle otg_online after 0->1 toggle.
+        online=$(cat "$otg_on" 2>/dev/null)
+        case "$online" in
+            ''|0) sleep 1 ;;
+        esac
     fi
 
     online=$(cat "$otg_on" 2>/dev/null)
@@ -151,6 +201,7 @@ ensure_usb_host_mode() {
     fi
 
     found_lan=0
+    usb2_fallback_orient=""
     orient_cache="/data/openwrt/run/usb3_orient"
     cached_o=$(cat "$orient_cache" 2>/dev/null)
     case "$cached_o" in
@@ -159,6 +210,7 @@ ensure_usb_host_mode() {
     esac
     cur_m="$mode"
     for try_o in $try_list; do
+        found_lan=0
         if [ "$cur_m" != "none" ]; then
             echo none > "$mode_f" 2>/dev/null
             sleep 2
@@ -176,6 +228,7 @@ ensure_usb_host_mode() {
                     log "USB 3.0 SuperSpeed active (orientation=$try_o)"
                     break 2
                 fi
+                usb2_fallback_orient="$try_o"
                 break
             fi
             sleep 1
@@ -183,11 +236,35 @@ ensure_usb_host_mode() {
         done
     done
 
+    if [ "$found_lan" != "1" ] && [ -n "$usb2_fallback_orient" ]; then
+        log "alternate lane failed; restoring USB 2.0 fallback (orientation=$usb2_fallback_orient)"
+        echo none > "$mode_f" 2>/dev/null
+        sleep 2
+        [ -w "$orient_f" ] && echo "$usb2_fallback_orient" > "$orient_f" 2>/dev/null
+        echo 1 > "$otg_sw" 2>/dev/null
+        if echo host > "$mode_f" 2>/dev/null; then
+            k=0
+            while [ $k -lt 5 ]; do
+                if host_has_lan; then
+                    found_lan=1
+                    break
+                fi
+                sleep 1
+                k=$((k+1))
+            done
+        fi
+    fi
+
     if [ "$found_lan" != "1" ]; then
-        # Plain charger without USB hub/NIC: restore idle state and back off 5 min (60 * 5s).
+        # Plain charger without USB hub/NIC: restore idle state.
+        # Only use the 5-min (60 * 5s) backoff in steady-state watchdog, not during boot.
         echo none > "$mode_f" 2>/dev/null
         [ -w "$orient_f" ] && echo none > "$orient_f" 2>/dev/null
-        USB_PROBE_SKIP=60
+        if [ "$probe_phase" = "boot" ]; then
+            USB_PROBE_SKIP=3
+        else
+            USB_PROBE_SKIP=60
+        fi
     fi
     if [ "$warp_dis" != "Y" ] && [ "$old_mmi" = "1" ]; then
         soc=$(cat "$cap_f" 2>/dev/null)
@@ -215,14 +292,19 @@ attach_lan_inplace() {
         $BB nsenter -t "$pid" -n -- "$BB" ip link set "$lan" name eth0 2>/dev/null || return 1
     fi
     $BB nsenter -t "$pid" -n -- ip link set eth0 up 2>/dev/null
-    $BB nsenter -t "$pid" -n -- ip addr replace 192.168.2.1/24 dev eth0 2>/dev/null
+    $BB nsenter -t "$pid" -n -- ip addr add 192.168.2.1/24 dev eth0 2>/dev/null
     $BB nsenter -t "$pid" -m -u -n -p -- /system/bin/chroot /data/openwrt/rootfs /bin/sh -c \
         'export PATH=/usr/sbin:/usr/bin:/sbin:/bin; /etc/init.d/network reload' >/dev/null 2>&1
-    sleep 1
+    sleep 2
     $BB nsenter -t "$pid" -n -- ip link set eth0 up 2>/dev/null
     $BB nsenter -t "$pid" -n -- ip addr add 192.168.2.1/24 dev eth0 2>/dev/null
+    $BB nsenter -t "$pid" -n -- ip link set veth-owrt up 2>/dev/null
+    $BB nsenter -t "$pid" -n -- ip addr add 10.200.1.2/30 dev veth-owrt 2>/dev/null
+    $BB nsenter -t "$pid" -n -- ip route replace default via 10.200.1.1 dev veth-owrt 2>/dev/null
 
     # Re-apply native IPv6 /64 prefix from active 5G WAN if available.
+    v6_net=""
+    v6_lan=""
     W=$(find_rmnet_wan)
     if [ -n "$W" ]; then
         v6_cidr=$(ip -6 addr show dev "$W" scope global 2>/dev/null | $BB awk '/inet6/ {print $2; exit}')
@@ -255,6 +337,14 @@ attach_lan_inplace() {
 
     $BB nsenter -t "$pid" -m -u -n -p -- /system/bin/chroot /data/openwrt/rootfs /bin/sh -c \
         'export PATH=/usr/sbin:/usr/bin:/sbin:/bin; /etc/init.d/dnsmasq restart; /etc/init.d/odhcpd restart' >/dev/null 2>&1
+    if [ -n "$v6_net" ]; then
+        ip -6 addr add fe80::1/64 dev veth-host 2>/dev/null
+        $BB nsenter -t "$pid" -n -- ip -6 addr add fe80::2/64 dev veth-owrt 2>/dev/null
+        $BB nsenter -t "$pid" -n -- ip -6 route replace default via fe80::1 dev veth-owrt onlink 2>/dev/null
+        $BB nsenter -t "$pid" -n -- ip -6 addr add "$v6_lan/64" dev eth0 2>/dev/null
+        $BB nsenter -t "$pid" -n -- ip -6 route replace "$v6_net" dev eth0 2>/dev/null
+        ip -6 route replace "$v6_net" via fe80::2 dev veth-host onlink table 200 2>/dev/null
+    fi
     ensure_container_fw
     container_has_lan
 }
@@ -265,15 +355,16 @@ find_rmnet_wan() {
     dev=$(ip -4 route show table all 2>/dev/null | $BB awk '/^default/ {
         d="";
         for (i=1;i<=NF;i++) if ($i=="dev") { d=$(i+1); break }
-        if (d ~ /^rmnet/) { print d; exit }
+        if (d ~ /^rmnet/ || d ~ /^v4-rmnet/) { print d; exit }
     }')
     if [ -n "$dev" ]; then
         echo "$dev"
         return 0
     fi
-    for iface in rmnet_data0 rmnet_data1 rmnet_data2 rmnet_data3 rmnet_data4 rmnet_data5; do
+    for iface in rmnet_data0 rmnet_data1 rmnet_data2 rmnet_data3 rmnet_data4 rmnet_data5 rmnet0 v4-rmnet_data0 v4-rmnet_data1 v4-rmnet_data2 v4-rmnet_data3 v4-rmnet_data4 v4-rmnet_data5; do
         ip -4 addr show "$iface" 2>/dev/null | grep -q 'inet ' || continue
-        ip route show table "$iface" 2>/dev/null | grep -q '^default' || continue
+        tbl="${iface#v4-}"
+        ip route show table "$tbl" 2>/dev/null | grep -q '^default' || ip route show table "$iface" 2>/dev/null | grep -q '^default' || continue
         echo "$iface"
         return 0
     done
@@ -325,52 +416,62 @@ ensure_wan() {
     esac
 }
 
-# Keep cpu7 offline and the battery in the 50-60% band.
-[ -f /data/openwrt/scripts/service_power_guard.sh ] && /system/bin/sh /data/openwrt/scripts/service_power_guard.sh
-
-# Optional headless power tuning (only when explicitly enabled).
-if [ -f "/data/openwrt/enable_headless" ] && [ -f "/data/openwrt/scripts/05_headless_power_control.sh" ]; then
-    /system/bin/sh /data/openwrt/scripts/05_headless_power_control.sh > /data/openwrt/logs/power.log 2>&1
-fi
-
-# Wait for Android to finish booting.
+# Wait for Android to finish booting at full CPU speed before throttling CPU
+# or starting OpenWrt, so boot-complete fires promptly and resets Magisk bootloop.
 i=0
 while [ "$(getprop sys.boot_completed)" != "1" ] && [ $i -lt 90 ]; do
     sleep 2
     i=$((i+1))
 done
+log "boot_completed=$(getprop sys.boot_completed 2>/dev/null) (waited $((i * 2))s)"
 
-# Wait for 5G data.  After a cold boot the modem/PDN can take over two minutes,
-# and Wi-Fi may already be the system default route, so poll rmnet explicitly.
-i=0
-IF=""
-while [ $i -lt 90 ]; do
-    IF=$(find_rmnet_wan)
-    [ -n "$IF" ] && break
-    sleep 2
-    i=$((i+1))
-done
-log "WAN interface: ${IF:-none}"
-
-# Wait for the USB LAN NIC so the container gets its LAN port on first start.
-ensure_usb_host_mode
-i=0
-while ! host_has_lan && [ $i -lt 15 ]; do
-    ensure_usb_host_mode
-    host_has_lan && break
-    sleep 2
-    i=$((i+1))
-done
-
-if container_running; then
-    log "container already running, skip"
+if [ -f "$DISABLE_FLAG" ]; then
+    log "disable_autorun present ($DISABLE_FLAG); skipping initial startup"
 else
-    log "starting OpenWrt container (WAN=${IF:-none})"
-    /system/bin/sh /data/openwrt/scripts/04_start_openwrt_and_network.sh >> "$LOG" 2>&1
-    log "04 exit=$?"
+    # Keep cpu7 offline and the battery in the 50-60% band (started after boot_completed).
+    [ -f /data/openwrt/scripts/service_power_guard.sh ] && /system/bin/sh /data/openwrt/scripts/service_power_guard.sh
+
+    # Optional headless power tuning (only when explicitly enabled).
+    if [ -f "/data/openwrt/enable_headless" ] && [ -f "/data/openwrt/scripts/05_headless_power_control.sh" ]; then
+        /system/bin/sh /data/openwrt/scripts/05_headless_power_control.sh > /data/openwrt/logs/power.log 2>&1
+    fi
+
+    # Wait for 5G data.  After a cold boot the modem/PDN can take over two minutes,
+    # and Wi-Fi may already be the system default route, so poll rmnet explicitly.
+    i=0
+    IF=""
+    while [ $i -lt 90 ]; do
+        IF=$(find_rmnet_wan)
+        [ -n "$IF" ] && break
+        sleep 2
+        i=$((i+1))
+    done
+    log "WAN interface: ${IF:-none}"
+
+    # Wait for the USB LAN NIC so the container gets its LAN port on first start.
+    ensure_usb_host_mode boot
+    i=0
+    while ! host_has_lan && [ $i -lt 15 ]; do
+        ensure_usb_host_mode boot
+        host_has_lan && break
+        sleep 2
+        i=$((i+1))
+    done
+
+    if container_running; then
+        log "container already running, skip"
+    else
+        log "starting OpenWrt container (WAN=${IF:-none})"
+        /system/bin/sh /data/openwrt/scripts/04_start_openwrt_and_network.sh >> "$LOG" 2>&1
+        log "04 exit=$?"
+    fi
+
+    ensure_wan
 fi
 
-ensure_wan
+# Clear any boot-phase USB probe backoff before entering the steady-state watchdog.
+USB_PROBE_SKIP=0
+USB_LAST_SIG=""
 
 # Watchdog: fast 5s liveness + USB LAN hot-attach loop; heavier WAN/fw/power
 # checks run every 6th tick (30s) to keep CPU/battery overhead minimal.
@@ -378,7 +479,7 @@ ensure_wan
 TICK=0
 while true; do
     sleep 5
-    [ -f /data/openwrt/disable_autorun ] && continue
+    [ -f "$DISABLE_FLAG" ] && continue
     TICK=$((TICK + 1))
 
     if [ $((TICK % 6)) -eq 0 ]; then
